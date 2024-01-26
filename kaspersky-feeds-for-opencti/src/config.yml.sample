@@ -1,0 +1,19 @@
+opencti:
+  url: 'http://localhost:8080'
+  token: 'ChangeMe'
+
+connector:
+  id: 'ChangeMe'
+  type: 'EXTERNAL_IMPORT'
+  name: 'Kaspersky Feeds'
+  scope: 'kaspersky'
+  confidence_level: 100
+  log_level: 'info'
+  update_existing_data: false
+  run_and_terminate: false
+
+kaspersky:
+  api_root: 'https://taxii.tip.kaspersky.com/v2'
+  api_token: 'ChangeMe'
+  initial_history: 604800
+  update_interval: 3600

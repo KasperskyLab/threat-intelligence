@@ -1,0 +1,9 @@
+# python bytecode cache
+__pycache__/
+*.py[cod]
+
+# virtual environment
+.venv/
+
+# config
+config.yml
