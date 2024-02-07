@@ -297,6 +297,7 @@ class Connector:
             time.sleep(self._update_interval)
 
     def _processed_object(self, stix_object: Dict) -> Dict:
+        stix_object = self._update_indicator_name(stix_object)
         stix_object = self._update_indicator_properties(stix_object)
         stix_object = self._update_confidence(stix_object)
         stix_object = self._update_score(stix_object)
@@ -356,6 +357,22 @@ class Connector:
             parts = record.split("=")
             if parts[0] == "threat_score":
                 stix_object["x_opencti_score"] = int(parts[1])
+
+        return stix_object
+
+    def _update_indicator_name(self, stix_object: Dict) -> Dict:
+        object_type = stix_object["type"]
+        if object_type != "indicator":
+            return stix_object
+
+        # Starting from version 5.12.15 OpenCTI uses field 'name' as unique
+        # identifier for indicators. As a result different indicators with
+        # the same name are merged into single one. To address this, the
+        # workaround is to remove the 'name' field and allow the OpenCTI
+        # Platform to handle the naming of indicators.
+
+        if "name" in stix_object:
+            del stix_object["name"]
 
         return stix_object
 
