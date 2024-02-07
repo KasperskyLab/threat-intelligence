@@ -3,14 +3,14 @@ services:
   kaspersky-feeds-for-opencti:
     build: .
     environment:
-      - OPENCTI_URL=http://localhost
+      - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=ChangeMe
       - CONNECTOR_ID=ChangeMe
       - CONNECTOR_TYPE=EXTERNAL_IMPORT
       - CONNECTOR_NAME=Kaspersky Feeds
       - CONNECTOR_SCOPE=kaspersky
-      - CONNECTOR_CONFIDENCE_LEVEL=100 # From 0 (Unknown) to 100 (Fully trusted)
-      - CONNECTOR_LOG_LEVEL=error
+      - CONNECTOR_CONFIDENCE_LEVEL=100
+      - CONNECTOR_LOG_LEVEL=info
       - CONNECTOR_UPDATE_EXISTING_DATA=false
       - CONNECTOR_EXPOSE_METRICS=false
       - KASPERSKY_API_ROOT=https://taxii.tip.kaspersky.com/v2/
