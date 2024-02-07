@@ -12,6 +12,7 @@ import copy
 import argparse
 from typing import Dict, List
 from datetime import datetime, timezone, timedelta
+import urllib3
 import yaml
 
 from pycti import OpenCTIConnectorHelper
@@ -398,6 +399,10 @@ if __name__ == "__main__":
     args_parser = argparse.ArgumentParser()
     args_parser.add_argument("-d", "--dry-run", action="store_true")
     args = args_parser.parse_args()
+
+    # We ignore warnings about insecure SSL/TLS connections when SSL
+    # verification is deliberately disabled by the user in the configuration.
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     config = Configuration()
     try:
