@@ -8,102 +8,106 @@ import sys
 import time
 import json
 import uuid
+import copy
 import argparse
 from typing import Dict, List
 from datetime import datetime, timezone, timedelta
 import yaml
 
-from pycti import OpenCTIConnectorHelper, get_config_variable
+from pycti import OpenCTIConnectorHelper
 from kaspersky import Taxii21Client, Stix21Source, Stix21Transformer
-
-
-CONFIG_FILE = "./config.yml"
-APPLICATION_NAMESPACE = "kaspersky"
-DEFAULT_CONFIGURATION = {
-    "opencti.ssl_verify": True,
-    "connector.name": "Kaspersky Feeds",
-    "connector.scope": "kaspersky",
-    "connector.confidence_level": "100",
-    "connector.log_level": "info",
-    "connector.update_existing_data": False,
-    f"{APPLICATION_NAMESPACE}.api_root": "https://taxii.tip.kaspersky.com/v2",
-    f"{APPLICATION_NAMESPACE}.ssl_verify": True,
-    f"{APPLICATION_NAMESPACE}.initial_history": 604800,  # is 7 days
-    f"{APPLICATION_NAMESPACE}.update_interval": 3600,  # is 1 hour
-    f"{APPLICATION_NAMESPACE}.expand_objects": True,
-    f"{APPLICATION_NAMESPACE}.collections": ["TAXII_*_Data_Feed"],
-}
 
 
 class Configuration:
     """Configuration reader"""
 
+    CONFIG_FILE = "./config.yml"
+    APPLICATION_NAMESPACE = "kaspersky"
+    DEFAULT_CONFIGURATION = {
+        "opencti.ssl_verify": True,
+        "connector.type": "EXTERNAL_IMPORT",
+        "connector.name": "Kaspersky Feeds",
+        "connector.scope": "kaspersky",
+        "connector.confidence_level": "100",
+        "connector.log_level": "info",
+        "connector.update_existing_data": False,
+        f"{APPLICATION_NAMESPACE}.api_root": "https://taxii.tip.kaspersky.com/v2",
+        f"{APPLICATION_NAMESPACE}.ssl_verify": True,
+        f"{APPLICATION_NAMESPACE}.initial_history": 604800,  # is 7 days
+        f"{APPLICATION_NAMESPACE}.update_interval": 3600,  # is 1 hour
+        f"{APPLICATION_NAMESPACE}.expand_objects": True,
+        f"{APPLICATION_NAMESPACE}.collections": ["TAXII_*_Data_Feed"],
+    }
+
     def __init__(self):
         """Initialize configuration reader object"""
-        self._config = Configuration._read_configuration(CONFIG_FILE)
-        for field_name, default_value in DEFAULT_CONFIGURATION.items():
-            field_path = Configuration._to_field_path(field_name)
-            if field_path[0] in self._config:
-                section = self._config[field_path[0]]
-                if field_path[1] in section:
-                    continue
-                section[field_path[1]] = default_value
-            else:
-                self._config[field_path[0]] = {}
-                self._config[field_path[0]][field_path[1]] = default_value
+        self._config = Configuration._build_configuration(
+            file_cfg=Configuration._read_file_config(),
+            env_cfg=Configuration._read_environment_config(),
+            default_cfg=Configuration._read_default_config(),
+        )
 
     @property
     def api_root(self) -> str:
         """API root parameter."""
-        parameter = f"{APPLICATION_NAMESPACE}.api_root"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.api_root"
         return self._read_string(parameter)
 
     @property
     def api_token(self) -> str:
         """API access token parameter."""
-        parameter = f"{APPLICATION_NAMESPACE}.api_token"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.api_token"
         return self._read_string(parameter)
 
     @property
     def ssl_verify(self) -> bool:
         """API access token parameter."""
-        parameter = f"{APPLICATION_NAMESPACE}.ssl_verify"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.ssl_verify"
         return self._read_bool(parameter)
 
     @property
     def initial_history(self) -> int:
         """Initial history offset."""
-        parameter = f"{APPLICATION_NAMESPACE}.initial_history"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.initial_history"
         return self._read_number(parameter)
 
     @property
     def update_interval(self) -> int:
         """Update interval value."""
-        parameter = f"{APPLICATION_NAMESPACE}.update_interval"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.update_interval"
         return self._read_number(parameter)
 
     @property
     def update_existing_data(self) -> bool:
         """Whether to update existing data."""
-        parameter = f"{APPLICATION_NAMESPACE}.update_existing_data"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.update_existing_data"
         return self._read_bool(parameter)
 
     @property
     def expand_objects(self) -> bool:
         """Whether to expand downloading objects."""
-        parameter = f"{APPLICATION_NAMESPACE}.expand_objects"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.expand_objects"
         return self._read_bool(parameter)
 
     @property
     def collections(self) -> List[str]:
         """TAXII collections."""
-        parameter = f"{APPLICATION_NAMESPACE}.collections"
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.collections"
         return self._read_string_list(parameter)
 
     @property
     def all(self) -> Dict:
         """All configuration as dictionary."""
         return self._config
+
+    def __str__(self) -> str:
+        """Format configuration as string."""
+        masked_config = copy.deepcopy(self._config)
+        for _, section in masked_config.items():
+            for key, _ in section.items():
+                if "token" in key:
+                    section[key] = "*****"
+        return str(masked_config)
 
     def _read_bool(self, field_name: str) -> bool:
         """Read specified field as boolean."""
@@ -135,17 +139,29 @@ class Configuration:
     def _read_raw_value(self, field_name: str, is_number: bool):
         """Read specified field without type casting."""
         field_path = Configuration._to_field_path(field_name)
-        env_variable = Configuration._to_env_variable(field_path)
-        return get_config_variable(
-            env_var=env_variable,
-            yaml_path=field_path,
-            config=self._config,
-            isNumber=is_number,
-        )
+        if field_path[0] not in self._config:
+            return None
+        section = self._config[field_path[0]]
+        if field_path[1] not in section:
+            return None
+        value = section[field_path[1]]
+        if is_number:
+            return int(value)
+        return value
 
     @staticmethod
-    def _read_configuration(config_path: str) -> Dict[str, str]:
-        """Read and parse yaml configuration file."""
+    def _to_field_path(field_name: str) -> List[str]:
+        """Convert field name to yaml-file path."""
+        return field_name.split(".")
+
+    @staticmethod
+    def _get_namespaces() -> List[str]:
+        return ["opencti", "connector", Configuration.APPLICATION_NAMESPACE]
+
+    @staticmethod
+    def _read_file_config() -> Dict[str, str]:
+        """Read configuration from configuration file."""
+        config_path = Configuration.CONFIG_FILE
         if not os.path.isabs(config_path):
             base_path = os.path.dirname(os.path.abspath(__file__))
             config_path = os.path.join(base_path, config_path)
@@ -155,14 +171,44 @@ class Configuration:
             return yaml.safe_load(config_file)
 
     @staticmethod
-    def _to_field_path(field_name: str) -> List[str]:
-        """Convert field name to yaml-file path."""
-        return field_name.split(".")
+    def _read_environment_config() -> Dict[str, str]:
+        """Read configuration from environment variables."""
+        namespaces = Configuration._get_namespaces()
+        env_mappings = {f"{namespace}_".upper(): namespace for namespace in namespaces}
+
+        env_config = {}
+        for var_name, var_value in os.environ.items():
+            for env_prefix, section in env_mappings.items():
+                if var_name.startswith(env_prefix):
+                    if section not in env_config:
+                        env_config[section] = {}
+                    field = var_name[len(env_prefix) :].lower()
+                    env_config[section][field] = var_value
+
+        return env_config
 
     @staticmethod
-    def _to_env_variable(field_path: List[str]) -> str:
-        """Convert yaml-file path into environment variable name."""
-        return "_".join(field_path).upper()
+    def _read_default_config() -> Dict[str, str]:
+        """Read default configuration."""
+        default_cfg = {}
+        for field_name, field_value in Configuration.DEFAULT_CONFIGURATION.items():
+            field_path = Configuration._to_field_path(field_name)
+            if field_path[0] not in default_cfg:
+                default_cfg[field_path[0]] = {}
+            default_cfg[field_path[0]][field_path[1]] = field_value
+        return default_cfg
+
+    @staticmethod
+    def _build_configuration(
+        file_cfg: Dict[str, str], env_cfg: Dict[str, str], default_cfg: Dict[str, str]
+    ) -> Dict[str, str]:
+        """Build application configuration by merging all the sources."""
+        merged_config = {}
+        for namespace in Configuration._get_namespaces():
+            merged_config[namespace] = default_cfg.get(namespace, {})
+            merged_config[namespace].update(file_cfg.get(namespace, {}))
+            merged_config[namespace].update(env_cfg.get(namespace, {}))
+        return merged_config
 
 
 # pylint: disable-next=too-few-public-methods
@@ -251,12 +297,12 @@ class Connector:
             time.sleep(self._update_interval)
 
     def _processed_object(self, stix_object: Dict) -> Dict:
-        stix_object = self._fill_indicator_properties(stix_object)
-        stix_object = self._fill_confidence(stix_object)
-        stix_object = self._fill_score(stix_object)
+        stix_object = self._update_indicator_properties(stix_object)
+        stix_object = self._update_confidence(stix_object)
+        stix_object = self._update_score(stix_object)
         return stix_object
 
-    def _fill_indicator_properties(self, stix_object: Dict) -> Dict:
+    def _update_indicator_properties(self, stix_object: Dict) -> Dict:
         object_type = stix_object["type"]
         if object_type == "indicator":
             stix_object["x_opencti_create_observables"] = True
@@ -277,7 +323,7 @@ class Connector:
                     stix_object["x_opencti_main_observable_type"] = "Email-Addr"
         return stix_object
 
-    def _fill_confidence(self, stix_object: Dict) -> Dict:
+    def _update_confidence(self, stix_object: Dict) -> Dict:
         object_types_with_confidence = [
             "attack-pattern",
             "course-of-action",
@@ -298,7 +344,7 @@ class Connector:
 
         return stix_object
 
-    def _fill_score(self, stix_object: Dict) -> Dict:
+    def _update_score(self, stix_object: Dict) -> Dict:
         if "description" not in stix_object:
             return stix_object
 
@@ -310,12 +356,14 @@ class Connector:
             parts = record.split("=")
             if parts[0] == "threat_score":
                 stix_object["x_opencti_score"] = int(parts[1])
+
         return stix_object
 
     def _print_object(self, stix_object: Dict) -> None:
         print(json.dumps(stix_object))
 
     def _send_object(self, stix_object: Dict) -> None:
+        self._opencti_api.log_debug(f"Sending object: {stix_object}")
         self._opencti_api.send_stix2_bundle(
             json.dumps(
                 {
@@ -337,6 +385,7 @@ if __name__ == "__main__":
     config = Configuration()
     try:
         opencti_client = OpenCTIConnectorHelper(config=config.all)
+        opencti_client.log_info(f"Configuration: {config}")
 
     except ValueError as exception:
         raise RuntimeError(
@@ -380,9 +429,9 @@ if __name__ == "__main__":
     connector = Connector(
         opencti_api=opencti_client,
         stix_source=stix_provider,
-        update_existing_data=config.update_existing_data,
         initial_history=config.initial_history,
         update_interval=config.update_interval,
+        update_existing_data=config.update_existing_data,
         dry_run=args.dry_run,
     )
     connector.run()
