@@ -341,8 +341,9 @@ class Connector:
         ]
 
         object_type = stix_object["type"]
-        if object_type in object_types_with_confidence:
-            stix_object["confidence"] = int(self._opencti_api.connect_confidence_level)
+        confidence_level = self._opencti_api.connect_confidence_level
+        if object_type in object_types_with_confidence and confidence_level is not None:
+            stix_object["confidence"] = int(confidence_level)
 
         return stix_object
 
