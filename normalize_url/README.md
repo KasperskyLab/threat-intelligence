@@ -71,3 +71,9 @@ Refer to the help section for a description of the general URL normalization rul
 - **not supported** automatic conversion of internationalized domain names based on the Punycode algorithm described in RFC 3492 (https://www.ietf.org/rfc/rfc3492.txt)
 
 - **singly convert** percent-encoded symbols to UTF-8, according to RFC 3986 (https://www.ietf.org/rfc/rfc3986.txt) and RFC 2279 (https://www.ietf.org/rfc/rfc2279.txt) 
+
+## License
+
+Copyright © 2024 AO Kaspersky Lab
+
+Licensed under the Apache 2.0 License. See the LICENSE.txt file for details.

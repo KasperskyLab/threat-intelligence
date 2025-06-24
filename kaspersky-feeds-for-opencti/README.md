@@ -84,3 +84,9 @@ Optionally, many of the configuration settings can be handled solely by environm
 **Note:** We strongly recommend to keep the `true` value for parameters `opencti.ssl_verify` and `kaspersky.ssl_verify`. If the `false` value for these parameters is specified, the connector will accept any TLS certificate presented by the server and will ignore hostname mismatches and/or expired certificates, which will make your application vulnerable to man-in-the-middle (MitM) attacks.
 
 **Note:** Since OpenCTI version >= 6.0, the `connector.confidence_level` parameter has been deprecated.
+
+## License
+
+Copyright © 2024 AO Kaspersky Lab
+
+Licensed under the Apache 2.0 License. See the LICENSE.txt file for details.

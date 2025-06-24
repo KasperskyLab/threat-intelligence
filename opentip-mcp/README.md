@@ -62,3 +62,9 @@ For Cline (on Windows):
 ```
 
 Note the env key in the JSON above: you need to set the value to your actual OpenTIP API key. Alternatively, you can remove this section and set `OPENTIP_API_KEY` environment variable directly.
+
+## License
+
+Copyright © 2025 AO Kaspersky Lab
+
+Licensed under the Apache 2.0 License. See the LICENSE.txt file for details.
