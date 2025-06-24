@@ -1,0 +1,16 @@
+[project]
+name = "opentip-mcp"
+version = "0.1.0"
+maintainers = [
+  {email = "ktlsupport@kaspersky.com"},
+]
+description = "Kaspersky OpenTIP Model Context Protocol server"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.8.1",
+    "pydantic>=2.11.4",
+]
