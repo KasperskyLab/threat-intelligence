@@ -42,7 +42,7 @@ func NormalizeIPv4(s string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		resultRow += strconv.Itoa(int(num)) + "."
+		resultRow += strconv.FormatUint(uint64(num), 10) + "."
 	}
 
 	num, err := parseNumber(octets[len(octets)-1], 5-len(octets))
