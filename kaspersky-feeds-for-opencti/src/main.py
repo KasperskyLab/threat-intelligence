@@ -42,10 +42,14 @@ class Configuration:
         "connector.type": "EXTERNAL_IMPORT",
         "connector.name": "Kaspersky Feeds",
         "connector.scope": "kaspersky",
-        "connector.confidence_level": "100",
+        "connector.confidence_level": 100,
+        "connector.threat_score": 100,
+        "connector.threat_score_high": 75,
+        "connector.threat_score_medium": 50,
         "connector.log_level": "info",
         "connector.update_existing_data": False,
         f"{APPLICATION_NAMESPACE}.api_root": "https://taxii.tip.kaspersky.com/v2",
+        f"{APPLICATION_NAMESPACE}.connection_timeout": 60,
         f"{APPLICATION_NAMESPACE}.ssl_verify": True,
         f"{APPLICATION_NAMESPACE}.initial_history": 604800,  # is 7 days
         f"{APPLICATION_NAMESPACE}.update_interval": 3600,  # is 1 hour
@@ -66,6 +70,12 @@ class Configuration:
         """API root parameter."""
         parameter = f"{Configuration.APPLICATION_NAMESPACE}.api_root"
         return self._read_string(parameter)
+    
+    @property
+    def connection_timeout(self) -> str:
+        """API connection timeout parameter."""
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.connection_timeout"
+        return self._read_number(parameter)
 
     @property
     def api_token(self) -> str:
@@ -249,34 +259,39 @@ class Connector:
     def run(self) -> None:
         """Run connector execution."""
         self._opencti_api.log_info("Connector started")
-        last_run = None
+        last_added = None
 
         while True:
             app_state = self._opencti_api.get_state()
-            first_launch = app_state is None or "last_run" not in app_state
+            first_launch = app_state is None or "last_added" not in app_state
             if first_launch:
                 self._opencti_api.log_info("Connector has never run")
                 if self._initial_history is not None:
-                    last_run = datetime.now(timezone.utc) - timedelta(
+                    last_added = datetime.now(timezone.utc) - timedelta(
                         seconds=self._initial_history
                     )
                     self._opencti_api.log_info(
                         "Connector initial timestamp: "
-                        + last_run.strftime("%Y-%m-%d %H:%M:%S")
+                        + last_added.strftime("%Y-%m-%d %H:%M:%S")
                     )
             else:
-                last_run = datetime.fromtimestamp(app_state["last_run"], timezone.utc)
+                last_added = datetime.fromtimestamp(app_state["last_added"], timezone.utc)
                 self._opencti_api.log_info(
-                    "Connector last run timestamp: "
-                    + last_run.strftime("%Y-%m-%d %H:%M:%S")
+                    "Connector last added timestamp: "
+                    + last_added.strftime("%Y-%m-%d %H:%M:%S")
                 )
 
             try:
                 objects_count = 0
-                timestamp = int(time.time())
+                timestamp = 0
 
-                for stix_object in self._stix_source.enumerate(added_after=last_run):
+                for stix_object in self._stix_source.enumerate(added_after=last_added):
                     stix_object = self._processed_object(stix_object)
+
+                    # get date_added from description
+                    if stix_object.get("type", "") == "indicator":
+                        timestamp = max(timestamp, self._get_date_added_ts_from_description(stix_object.get("description", "")))
+
                     if self._dry_run:
                         self._print_object(stix_object)
                     else:
@@ -289,7 +304,8 @@ class Connector:
                     )
 
                 else:
-                    self._opencti_api.set_state({"last_run": timestamp})
+                    if timestamp > 0:  # Only update state if we have valid timestamp
+                        self._opencti_api.set_state({"last_added": timestamp})
                     self._opencti_api.log_info(
                         f"Connector sent {objects_count} objects"
                     )
@@ -311,7 +327,6 @@ class Connector:
             time.sleep(self._update_interval)
 
     def _processed_object(self, stix_object: Dict) -> Dict:
-        stix_object = self._update_indicator_name(stix_object)
         stix_object = self._update_indicator_properties(stix_object)
         stix_object = self._update_confidence(stix_object)
         stix_object = self._update_score(stix_object)
@@ -320,22 +335,7 @@ class Connector:
     def _update_indicator_properties(self, stix_object: Dict) -> Dict:
         object_type = stix_object["type"]
         if object_type == "indicator":
-            stix_object["x_opencti_create_observables"] = True
             stix_object["x_opencti_create_indicators"] = True
-            match = re.search(r"\[(.*?):.*'(.*?)\'\]", stix_object["pattern"])
-            if match is not None:
-                if match[1] == "ipv4-addr":
-                    stix_object["x_opencti_main_observable_type"] = "IPv4-Addr"
-                elif match[1] == "ipv6-addr":
-                    stix_object["x_opencti_main_observable_type"] = "IPv6-Addr"
-                elif match[1] == "file":
-                    stix_object["x_opencti_main_observable_type"] = "File"
-                elif match[1] == "domain-name":
-                    stix_object["x_opencti_main_observable_type"] = "Domain-Name"
-                elif match[1] == "url":
-                    stix_object["x_opencti_main_observable_type"] = "Url"
-                elif match[1] == "email-addr":
-                    stix_object["x_opencti_main_observable_type"] = "Email-Addr"
         return stix_object
 
     def _update_confidence(self, stix_object: Dict) -> Dict:
@@ -354,40 +354,46 @@ class Connector:
         ]
 
         object_type = stix_object["type"]
-        confidence_level = self._opencti_api.connect_confidence_level
+        confidence_level = self._opencti_api.config["connector"]["confidence_level"]
         if object_type in object_types_with_confidence and confidence_level is not None:
             stix_object["confidence"] = int(confidence_level)
 
         return stix_object
 
     def _update_score(self, stix_object: Dict) -> Dict:
-        if "description" not in stix_object:
-            return stix_object
+        object_types_with_score = [
+            "indicator",
+            "file",
+            "domain-name",
+            "url",
+            "ipv4-addr",
+        ]
+        default_threat_score = int(self._opencti_api.config["connector"]["threat_score"])
+        threat_score_high    = int(self._opencti_api.config["connector"]["threat_score_high"])
+        threat_score_medium  = int(self._opencti_api.config["connector"]["threat_score_medium"])
+        if stix_object["type"] in object_types_with_score and default_threat_score is not None:
+            stix_object["x_opencti_score"] = int(default_threat_score)
 
-        description = stix_object["description"]
+        if "description" not in stix_object:
+            if "x_opencti_description" not in stix_object:
+                return stix_object
+            
+            description = stix_object["x_opencti_description"]
+            labels_key = "x_opencti_labels"
+        else:
+            description = stix_object["description"]
+            labels_key = "labels"
+
+        if labels_key not in stix_object:
+            stix_object[labels_key] = []
         if "threat_score=" not in description:
+            stix_object[labels_key].append(self._calc_threat_score_label(default_threat_score, threat_score_high, threat_score_medium))
             return stix_object
 
         for record in str(description).split(";"):
             parts = record.split("=")
             if parts[0] == "threat_score":
-                stix_object["x_opencti_score"] = int(parts[1])
-
-        return stix_object
-
-    def _update_indicator_name(self, stix_object: Dict) -> Dict:
-        object_type = stix_object["type"]
-        if object_type != "indicator":
-            return stix_object
-
-        # Starting from version 5.12.15 OpenCTI uses field 'name' as unique
-        # identifier for indicators. As a result different indicators with
-        # the same name are merged into single one. To address this, the
-        # workaround is to remove the 'name' field and allow the OpenCTI
-        # Platform to handle the naming of indicators.
-
-        if "name" in stix_object:
-            del stix_object["name"]
+                stix_object[labels_key].append(self._calc_threat_score_label(int(parts[1]), threat_score_high, threat_score_medium))
 
         return stix_object
 
@@ -407,6 +413,29 @@ class Connector:
             ),
             update=self._update_existing_data,
         )
+
+    def _get_date_added_ts_from_description(self, description: str) -> str:
+        date_added_ts = 0
+        if "date_added=" not in description:
+            return date_added_ts
+        
+        date_added_str = description.split("date_added=")[1].split(";")[0]
+        if date_added_str:
+            try:
+                date_added = datetime.strptime(date_added_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                date_added_ts = int(date_added.timestamp())
+            except ValueError:
+                self._opencti_api.log_warning(f"Invalid date format in description: {date_added_str}")
+        return date_added_ts
+
+    @staticmethod
+    def _calc_threat_score_label(score: int, score_high: int, score_medium: int) -> str:
+        if score >= score_high:
+            return "threat_score:kaspersky:high"
+        elif score >= score_medium:
+            return "threat_score:kaspersky:medium"
+        else:
+            return "threat_score:kaspersky:low"
 
 
 if __name__ == "__main__":
@@ -453,6 +482,7 @@ if __name__ == "__main__":
         api_token=config.api_token,
         ssl_verify=config.ssl_verify,
         collections=config.collections,
+        timeout=config.connection_timeout,
         logger=opencti_client,
     )
 

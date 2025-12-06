@@ -42,32 +42,63 @@ class IndicatorsTransform(Transform):
                 if object_type == "threat-actor":
                     relationships.append(
                         build_relationship(
-                            source=indicator, target=stix_object, link_type="indicates"
+                            source=indicator,
+                            target=stix_object,
+                            link_type="indicates",
+                            created_by_ref=self._author["id"],
+                            description=indicator.get("description", ""),
+                            labels=indicator.get("labels", []),
                         )
                     )
 
                 elif object_type == "location":
-                    if LOCATION_ROLE in stix_object:
-                        location_role = stix_object[LOCATION_ROLE]
-                        if location_role == LocationRoles.ACTOR:
-                            relationships.append(
-                                build_relationship(
-                                    source=indicator,
-                                    target=stix_object,
-                                    link_type="related-to",
-                                )
-                            )
+                    relationships.append(
+                        build_relationship(
+                            source=indicator,
+                            target=stix_object,
+                            link_type="related-to",
+                            created_by_ref=self._author["id"],
+                            description=indicator.get("description", ""),
+                            labels=indicator.get("labels", []),
+                        )
+                    )
 
                 elif object_type == "malware":
-                    # pylint: disable-next=duplicate-code
-                    malware_role = stix_object.get(MALWARE_ROLE, None)
-                    if malware_role == MalwareRoles.REAL_ACTOR:
+                    relationships.append(
+                        build_relationship(
+                            source=indicator,
+                            target=stix_object,
+                            link_type="related-to",
+                            created_by_ref=self._author["id"],
+                            description=indicator.get("description", ""),
+                            labels=indicator.get("labels", []),
+                        )
+                    )
+
+                elif object_type == "identity":
+                    identity_class = stix_object["identity_class"]
+                    if identity_class == "class":
                         relationships.append(
                             build_relationship(
                                 source=indicator,
                                 target=stix_object,
-                                link_type="indicates",
+                                link_type="related-to",
+                                created_by_ref=self._author["id"],
+                                description=indicator.get("description", ""),
+                                labels=indicator.get("labels", []),
                             )
                         )
+
+                elif object_type in ["file", "domain-name", "url", "ipv4-addr"]:
+                    relationships.append(
+                        build_relationship(
+                            source=indicator,
+                            target=stix_object,
+                            link_type="based-on",
+                            created_by_ref=self._author["id"],
+                            description=indicator.get("description", ""),
+                            labels=indicator.get("labels", []),
+                        )
+                    )
 
         return relationships

@@ -17,6 +17,8 @@
 
 import json
 from typing import Dict, List
+from importlib.metadata import version
+from packaging import version as v
 
 import stix2
 from pycti import ThreatActor
@@ -30,6 +32,7 @@ from .utils import (
     build_relationship,
 )
 
+PYCTI_VERSION = v.parse(version("pycti"))
 
 def location_link_type(location_object: Dict) -> str:
     """Estimate relationship link type based on location object attributes."""
@@ -55,55 +58,16 @@ class ActorsTransform(Transform):
             if len(actor_name) == 0:
                 continue
 
+            if PYCTI_VERSION >= v.parse("6.4.0"):
+                obj_id = ThreatActor.generate_id(actor_name, 'threat-actor')
+            else:
+                obj_id = ThreatActor.generate_id(actor_name),
+
             stix_object = stix2.v21.ThreatActor(
-                id=ThreatActor.generate_id(actor_name),
+                id=obj_id,
                 name=actor_name,
                 created_by_ref=self._author["id"],
             )
             stix_objects.append(json.loads(stix_object.serialize()))
 
         return stix_objects
-
-    def build_relationships(self, stix_objects: List[Dict]) -> List[Dict]:
-        threat_actors = filter(
-            lambda stix_object: stix_object["type"] == "threat-actor", stix_objects
-        )
-
-        relationships = []
-        for threat_actor in threat_actors:
-            for stix_object in stix_objects:
-                # pylint: disable-next=duplicate-code
-                object_type = stix_object["type"]
-
-                if object_type == "identity":
-                    identity_class = stix_object["identity_class"]
-                    if identity_class == "class":
-                        relationships.append(
-                            build_relationship(
-                                source=threat_actor,
-                                target=stix_object,
-                                link_type="targets",
-                            )
-                        )
-
-                elif object_type == "location":
-                    link_type = location_link_type(stix_object)
-                    relationships.append(
-                        build_relationship(
-                            source=threat_actor, target=stix_object, link_type=link_type
-                        )
-                    )
-
-                elif object_type == "malware":
-                    # pylint: disable-next=duplicate-code
-                    malware_role = stix_object.get(MALWARE_ROLE, None)
-                    if malware_role == MalwareRoles.REAL_ACTOR:
-                        relationships.append(
-                            build_relationship(
-                                source=threat_actor,
-                                target=stix_object,
-                                link_type="uses",
-                            )
-                        )
-
-        return relationships

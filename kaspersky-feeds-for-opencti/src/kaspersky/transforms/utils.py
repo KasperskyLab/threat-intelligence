@@ -16,6 +16,7 @@
 """Kaspersky utils module."""
 
 import json
+import re
 from enum import Enum
 from typing import Dict
 
@@ -34,6 +35,11 @@ LOCATION_ROLE = f"{TEMPORAL_ATTRIBUTE_PREFIX}location_role"
 MALWARE_ROLE = f"{TEMPORAL_ATTRIBUTE_PREFIX}malware_role"
 
 
+# Regular expression to match quoted words that may contain escaped quotation mark inside
+QUOTED_WORD_PATTERN = re.compile(
+    r"'((?:\\'|[^'])*)'"
+)
+
 class LocationRoles(Enum):
     """Meanings of location."""
 
@@ -48,7 +54,7 @@ class MalwareRoles(Enum):
     FAKE_GROUP = "group"
 
 
-def build_relationship(source: Dict, target: Dict, link_type: str) -> Dict:
+def build_relationship(source: Dict, target: Dict, link_type: str, created_by_ref: str, description: str = "", labels: list[str] = []) -> Dict:
     """
         Creates stix 2.1 relationship object.
     :param source: relationship source object.
@@ -65,5 +71,13 @@ def build_relationship(source: Dict, target: Dict, link_type: str) -> Dict:
         relationship_type=link_type,
         source_ref=link_source,
         target_ref=link_target,
+        created_by_ref=created_by_ref,
+        description=description,
+        labels=labels,
     )
     return json.loads(stix_object.serialize())
+
+def extract_first_quoted_word(pattern: str):
+    match = QUOTED_WORD_PATTERN.search(pattern)
+    if match:
+        return match.group(1)

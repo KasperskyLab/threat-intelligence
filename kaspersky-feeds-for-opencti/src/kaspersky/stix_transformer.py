@@ -31,6 +31,8 @@ from .transforms import (
     LocationsTransform,
     MalwaresTransform,
     ReportsTransform,
+    ObservableTransform,
+    extract_first_quoted_word
 )
 
 
@@ -75,6 +77,17 @@ def extract_context(stix_object: Dict) -> Dict:
 
 def processed_stix_object(stix_object: Dict) -> Dict:
     """Process stix2 object by adjusting some fields."""
+
+    # set name to first value in pattern
+    if stix_object["type"] == "indicator" and "pattern" in stix_object:
+        ioc_type = stix_object.get("name", "")
+        pattern = stix_object["pattern"]
+        if ioc_type == "URL" and " LIKE " in pattern[:pattern.find("'")]:
+            stix_object["name"] = extract_first_quoted_word(pattern).replace("%", "*").replace("_", "?")
+        else:
+            stix_object["name"] = extract_first_quoted_word(pattern)
+
+    # remove internal attributes
     attributes = list(stix_object.keys())
     for attribute in attributes:
         if attribute.startswith(TEMPORAL_ATTRIBUTE_PREFIX):
@@ -105,6 +118,7 @@ class Stix21Transformer(Stix21Source):
             LocationsTransform(author=self._author),
             MalwaresTransform(author=self._author),
             ReportsTransform(author=self._author),
+            ObservableTransform(author=self._author),
         ]
 
     def enumerate(self, added_after: datetime = None) -> Generator[Dict, None, None]:

@@ -15,6 +15,7 @@
 #
 """Kaspersky taxii client module."""
 
+import time
 from datetime import datetime
 from fnmatch import fnmatch
 from typing import Any, List, Dict, Generator
@@ -122,6 +123,10 @@ def make_feed_label(name: str) -> str:
     """Create label from TAXII collection name."""
     return name.removeprefix("TAXII_").lower()
 
+def replace_string_in_array(array, old_string, new_string):
+    """Replaces all occurrences of a old string with a new string in an array."""
+    return [new_string if item == old_string else item for item in array]
+
 
 def processed_stix_object(collection: str, stix_object: Dict) -> Dict:
     """Process stix2 object by adjusting some fields."""
@@ -131,6 +136,7 @@ def processed_stix_object(collection: str, stix_object: Dict) -> Dict:
 
     if "labels" not in stix_object:
         stix_object["labels"] = []
+    stix_object["labels"] = replace_string_in_array(stix_object["labels"], "malicious-activity", "malicious-activity:kaspersky")
     stix_object["labels"].append(make_feed_label(collection))
 
     if "valid_until" in stix_object:
@@ -195,6 +201,19 @@ class Taxii21Client(Stix21Source):
             if fnmatch(collection.title, expectaion):
                 return True
         return False
+    
+    def _with_retry(self, gen_func, retries=3, *args, **kwargs):
+        for attempt in range(1, retries + 1):
+            try:
+                for value in gen_func(*args, **kwargs):
+                    yield value
+                return
+            except Exception as e:
+                if attempt == 3:
+                    raise e
+                self._logger.log_error(f"Attempt {attempt} failed with error: {e}. Retrying...")
+                time.sleep(attempt * 2)
+        return None
 
     def enumerate(self, added_after: datetime = None) -> Generator[Dict, None, None]:
         """
@@ -236,7 +255,7 @@ class Taxii21Client(Stix21Source):
                     f"Reading objects from collection {collection.id} [{collection.title}]..."
                 )
 
-                pages = as_pages(collection.get_objects, **filters)
+                pages = self._with_retry(as_pages, retries=3, func=collection.get_objects, **filters)
                 for envelop in pages:
                     objects_count += len(envelop["objects"])
                     for stix_object in envelop["objects"]:

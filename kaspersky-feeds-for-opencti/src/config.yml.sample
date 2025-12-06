@@ -8,12 +8,16 @@ connector:
   name: 'Kaspersky Feeds'
   scope: 'kaspersky'
   confidence_level: 100
+  threat_score: 100
+  threat_score_high: 75
+  threat_score_medium: 50
   log_level: 'info'
   update_existing_data: false
   run_and_terminate: false
 
 kaspersky:
   api_root: 'https://taxii.tip.kaspersky.com/v2'
+  connection_timeout: 60
   api_token: 'ChangeMe'
   initial_history: 604800
   update_interval: 3600

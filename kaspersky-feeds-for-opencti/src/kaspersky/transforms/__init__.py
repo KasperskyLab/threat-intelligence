@@ -20,4 +20,6 @@ from .industries_transform import IndustriesTransform
 from .locations_transform import LocationsTransform
 from .malwares_transform import MalwaresTransform
 from .reports_transform import ReportsTransform
+from .observable_transform import ObservableTransform
 from .utils import TEMPORAL_ATTRIBUTE_PREFIX
+from .utils import extract_first_quoted_word
