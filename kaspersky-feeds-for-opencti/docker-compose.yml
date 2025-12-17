@@ -1,3 +1,5 @@
+# NOTE: This docker-compose.yml is provided as an example only.
+# Use it as a reference and adapt to your environment.
 version: "3.8"
 services:
   kaspersky-feeds-for-opencti:
@@ -17,7 +19,7 @@ services:
       - CONNECTOR_UPDATE_EXISTING_DATA=false
       - CONNECTOR_EXPOSE_METRICS=false
       - KASPERSKY_API_ROOT=https://taxii.tip.kaspersky.com/v2/
-      - KASPERSKY_CONNECTION_TIMEOUT=60,
+      - KASPERSKY_CONNECTION_TIMEOUT=60
       - KASPERSKY_API_TOKEN=ChangeMe
       - KASPERSKY_INITIAL_HISTORY=604800 # 7 days in seconds
       - KASPERSKY_UPDATE_INTERVAL=3600 # 1 hour in seconds
