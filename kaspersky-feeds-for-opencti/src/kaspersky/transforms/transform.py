@@ -47,3 +47,17 @@ class Transform:
         :return: list of new stix 2.1 relationships.
         """
         return []
+
+    # pylint: disable-next=unused-argument
+    def finalize_objects(self) -> List[Dict]:
+        """
+            Finalize transform execution by building additional stix 2.1
+            objects using the internally aggregated context and objects.
+
+            This method is called after build_objects and build_relationships
+            and is intended for objects that cannot be constructed during
+            incremental processing.
+
+        :return: list of new stix 2.1 objects.
+        """
+        return []

@@ -1,10 +1,10 @@
 # The base image
-FROM python:3.11-alpine as base
+FROM python:3.11-alpine AS base
 
 ###########################################################
 #                       Building
 ###########################################################
-FROM base as builder
+FROM base AS builder
 
 # Working directory
 WORKDIR /builder

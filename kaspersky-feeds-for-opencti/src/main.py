@@ -43,6 +43,7 @@ class Configuration:
         "connector.name": "Kaspersky Feeds",
         "connector.scope": "kaspersky",
         "connector.confidence_level": 100,
+        "connector.threat_score_from_description": False,
         "connector.threat_score": 100,
         "connector.threat_score_high": 75,
         "connector.threat_score_medium": 50,
@@ -54,6 +55,8 @@ class Configuration:
         f"{APPLICATION_NAMESPACE}.initial_history": 604800,  # is 7 days
         f"{APPLICATION_NAMESPACE}.update_interval": 3600,  # is 1 hour
         f"{APPLICATION_NAMESPACE}.expand_objects": True,
+        f"{APPLICATION_NAMESPACE}.create_indicators": True,
+        f"{APPLICATION_NAMESPACE}.create_observables": True,
         f"{APPLICATION_NAMESPACE}.collections": ["TAXII_*_Data_Feed"],
     }
 
@@ -70,7 +73,7 @@ class Configuration:
         """API root parameter."""
         parameter = f"{Configuration.APPLICATION_NAMESPACE}.api_root"
         return self._read_string(parameter)
-    
+
     @property
     def connection_timeout(self) -> str:
         """API connection timeout parameter."""
@@ -104,13 +107,25 @@ class Configuration:
     @property
     def update_existing_data(self) -> bool:
         """Whether to update existing data."""
-        parameter = f"{Configuration.APPLICATION_NAMESPACE}.update_existing_data"
+        parameter = f"connector.update_existing_data"
         return self._read_bool(parameter)
 
     @property
     def expand_objects(self) -> bool:
         """Whether to expand downloading objects."""
         parameter = f"{Configuration.APPLICATION_NAMESPACE}.expand_objects"
+        return self._read_bool(parameter)
+
+    @property
+    def create_indicators(self) -> bool:
+        """Whether to create indicators."""
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.create_indicators"
+        return self._read_bool(parameter)
+
+    @property
+    def create_observables(self) -> bool:
+        """Whether to create observables."""
+        parameter = f"{Configuration.APPLICATION_NAMESPACE}.create_observables"
         return self._read_bool(parameter)
 
     @property
@@ -136,7 +151,15 @@ class Configuration:
     def _read_bool(self, field_name: str) -> bool:
         """Read specified field as boolean."""
         value = self._read_raw_value(field_name, is_number=False)
-        return bool(value) if value is not None else None
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.lower() in ['true', 'yes']:
+                return True
+            if value.lower() in ['false', 'no']:
+                return False
+            raise RuntimeError(f"Invalid configuration: '{field_name}' contains invalid boolean value: '{value}'")
+        return bool(value)
 
     def _read_number(self, field_name: str) -> int:
         """Read specified field as number."""
@@ -202,6 +225,8 @@ class Configuration:
 
         env_config = {}
         for var_name, var_value in os.environ.items():
+            if var_value == "":
+                continue
             for env_prefix, section in env_mappings.items():
                 if var_name.startswith(env_prefix):
                     if section not in env_config:
@@ -275,28 +300,31 @@ class Connector:
                         + last_added.strftime("%Y-%m-%d %H:%M:%S")
                     )
             else:
-                last_added = datetime.fromtimestamp(app_state["last_added"], timezone.utc)
+                last_added = datetime.fromtimestamp(float(app_state["last_added"]), timezone.utc)
                 self._opencti_api.log_info(
                     "Connector last added timestamp: "
                     + last_added.strftime("%Y-%m-%d %H:%M:%S")
                 )
 
             try:
+                run_started_at = int(datetime.now(timezone.utc).timestamp())
                 objects_count = 0
-                timestamp = 0
+                timestamp = 0.0
 
-                for stix_object in self._stix_source.enumerate(added_after=last_added):
-                    stix_object = self._processed_object(stix_object)
-
-                    # get date_added from description
-                    if stix_object.get("type", "") == "indicator":
-                        timestamp = max(timestamp, self._get_date_added_ts_from_description(stix_object.get("description", "")))
-
+                for stix_batch in self._get_batches(self._stix_source.enumerate(added_after=last_added), 1000):
+                    for obj in stix_batch:
+                        # Update high-watermark from any object carrying source description.
+                        # This keeps incremental state progressing even when indicators are not emitted.
+                        object_description = obj.get("description") or obj.get("x_opencti_description") or ""
+                        timestamp = max(
+                            timestamp,
+                            self._get_date_added_ts_from_description(object_description),
+                        )
                     if self._dry_run:
-                        self._print_object(stix_object)
+                        self._print_object(stix_batch)
                     else:
-                        self._send_object(stix_object)
-                    objects_count += 1
+                        self._send_objects(stix_batch)
+                    objects_count += len(stix_batch)
 
                 if self._dry_run:
                     self._opencti_api.log_info(
@@ -304,8 +332,11 @@ class Connector:
                     )
 
                 else:
-                    if timestamp > 0:  # Only update state if we have valid timestamp
-                        self._opencti_api.set_state({"last_added": timestamp})
+                    state_timestamp = run_started_at
+                    if timestamp > state_timestamp:
+                        state_timestamp = timestamp
+                    self._opencti_api.set_state({"last_added": int(state_timestamp)})
+                    self._sync_state()
                     self._opencti_api.log_info(
                         f"Connector sent {objects_count} objects"
                     )
@@ -326,16 +357,21 @@ class Connector:
             )
             time.sleep(self._update_interval)
 
+    def _get_batches(self, stix_objects, size: int):
+        batch = []
+        for obj in stix_objects:
+            obj = self._processed_object(obj)
+
+            batch.append(obj)
+            if len(batch) == size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     def _processed_object(self, stix_object: Dict) -> Dict:
-        stix_object = self._update_indicator_properties(stix_object)
         stix_object = self._update_confidence(stix_object)
         stix_object = self._update_score(stix_object)
-        return stix_object
-
-    def _update_indicator_properties(self, stix_object: Dict) -> Dict:
-        object_type = stix_object["type"]
-        if object_type == "indicator":
-            stix_object["x_opencti_create_indicators"] = True
         return stix_object
 
     def _update_confidence(self, stix_object: Dict) -> Dict:
@@ -377,12 +413,21 @@ class Connector:
         if "description" not in stix_object:
             if "x_opencti_description" not in stix_object:
                 return stix_object
-            
+
             description = stix_object["x_opencti_description"]
             labels_key = "x_opencti_labels"
         else:
             description = stix_object["description"]
             labels_key = "labels"
+
+        if self._opencti_api.config["connector"]["threat_score_from_description"] == True:
+            if "threat_score=" in description:
+                for record in str(description).split(";"):
+                    parts = record.split("=")
+                    if parts[0] == "threat_score":
+                        score = int(parts[1])
+                        stix_object["x_opencti_score"] = score
+            return stix_object
 
         if labels_key not in stix_object:
             stix_object[labels_key] = []
@@ -397,36 +442,56 @@ class Connector:
 
         return stix_object
 
-    def _print_object(self, stix_object: Dict) -> None:
-        print(json.dumps(stix_object))
+    def _print_object(self, stix_objects: List) -> None:
+        for obj in stix_objects:
+            print(json.dumps(obj))
 
-    def _send_object(self, stix_object: Dict) -> None:
-        self._opencti_api.log_debug(f"Sending object: {stix_object}")
+    def _send_objects(self, stix_objects: List) -> None:
+        for obj in stix_objects:
+            self._opencti_api.log_debug(f"Sending object: {obj}")
         self._opencti_api.send_stix2_bundle(
             json.dumps(
                 {
                     "type": "bundle",
                     "id": f"bundle--{str(uuid.uuid4())}",
                     "spec_version": "2.1",
-                    "objects": [stix_object],
+                    "objects": stix_objects,
                 }
             ),
             update=self._update_existing_data,
         )
 
-    def _get_date_added_ts_from_description(self, description: str) -> str:
-        date_added_ts = 0
+    def _get_date_added_ts_from_description(self, description: str) -> float:
+        date_added_ts = 0.0
         if "date_added=" not in description:
             return date_added_ts
-        
+
         date_added_str = description.split("date_added=")[1].split(";")[0]
         if date_added_str:
             try:
                 date_added = datetime.strptime(date_added_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-                date_added_ts = int(date_added.timestamp())
+                date_added_ts = date_added.timestamp()
             except ValueError:
                 self._opencti_api.log_warning(f"Invalid date format in description: {date_added_str}")
         return date_added_ts
+
+    def _sync_state(self) -> None:
+        """
+        Force state synchronization for one-shot runs.
+
+        In recent pycti versions `set_state()` only updates in-memory state.
+        Persisting to OpenCTI happens during ping, which may not execute before
+        process exit in run-and-terminate mode.
+        """
+        force_ping = getattr(self._opencti_api, "force_ping", None)
+        if callable(force_ping):
+            try:
+                force_ping()
+            # pylint: disable-next=broad-exception-caught
+            except Exception as exception:
+                self._opencti_api.log_warning(
+                    f"Unable to synchronize connector state: {exception}"
+                )
 
     @staticmethod
     def _calc_threat_score_label(score: int, score_high: int, score_medium: int) -> str:
@@ -448,9 +513,30 @@ if __name__ == "__main__":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     config = Configuration()
+
+    if not config.expand_objects and not config.create_indicators:
+        raise RuntimeError(
+            "Invalid configuration: 'kaspersky.expand_objects' and "
+            "'kaspersky.create_indicators' are both set to 'false'.\n"
+            "No STIX objects will be produced with this configuration. "
+            "At least one of these options must be enabled."
+        )
+    if not config.create_indicators and not config.create_observables:
+        raise RuntimeError(
+            "Invalid configuration: 'kaspersky.create_indicators' and "
+            "'kaspersky.create_observables' are both set to 'false'.\n"
+            "At least one must be set to 'true' to ensure meaningful STIX output.")
+
     try:
         opencti_client = OpenCTIConnectorHelper(config=config.all)
         opencti_client.log_info(f"Configuration: {config}")
+        opencti_client.log_info(
+            "Feature flags: "
+            f"connector.threat_score_from_description={config.all['connector']['threat_score_from_description']}, "
+            f"kaspersky.expand_objects={config.expand_objects}, "
+            f"kaspersky.create_indicators={config.create_indicators}, "
+            f"kaspersky.create_observables={config.create_observables}"
+        )
 
     except ValueError as exception:
         raise RuntimeError(
@@ -486,11 +572,12 @@ if __name__ == "__main__":
         logger=opencti_client,
     )
 
-    if config.expand_objects:
-        stix_provider = Stix21Transformer(source=taxii_client)
-        opencti_client.log_info("Generation of additional stix2 objects enabled")
-    else:
-        stix_provider = taxii_client
+    stix_provider = Stix21Transformer(
+        source=taxii_client,
+        expand_objects=config.expand_objects,
+        create_indicators=config.create_indicators,
+        create_observables=config.create_observables
+    )
 
     connector = Connector(
         opencti_api=opencti_client,

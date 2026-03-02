@@ -16,6 +16,7 @@
 """Kaspersky taxii client module."""
 
 import time
+import re
 from datetime import datetime
 from fnmatch import fnmatch
 from typing import Any, List, Dict, Generator
@@ -27,7 +28,6 @@ from taxii2client.common import _HTTPConnection
 from taxii2client.v21 import ApiRoot, Collection, as_pages
 
 from .stix_source import Stix21Source
-
 
 class Taxii21Session:
     """
@@ -127,7 +127,6 @@ def replace_string_in_array(array, old_string, new_string):
     """Replaces all occurrences of a old string with a new string in an array."""
     return [new_string if item == old_string else item for item in array]
 
-
 def processed_stix_object(collection: str, stix_object: Dict) -> Dict:
     """Process stix2 object by adjusting some fields."""
     object_type = stix_object["type"]
@@ -201,15 +200,23 @@ class Taxii21Client(Stix21Source):
             if fnmatch(collection.title, expectaion):
                 return True
         return False
-    
+
     def _with_retry(self, gen_func, retries=3, *args, **kwargs):
         for attempt in range(1, retries + 1):
             try:
                 for value in gen_func(*args, **kwargs):
                     yield value
                 return
+            except HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else None
+                if status_code == HTTPStatus.NOT_FOUND:
+                    raise
+                if attempt == retries:
+                    raise
+                self._logger.log_error(f"Attempt {attempt} failed with error: {e}. Retrying...")
+                time.sleep(attempt * 2)
             except Exception as e:
-                if attempt == 3:
+                if attempt == retries:
                     raise e
                 self._logger.log_error(f"Attempt {attempt} failed with error: {e}. Retrying...")
                 time.sleep(attempt * 2)

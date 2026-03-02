@@ -15,6 +15,7 @@
 #
 """ Kaspersky stix transformer module."""
 
+import re
 import json
 from typing import Dict, Generator
 from datetime import datetime
@@ -77,11 +78,26 @@ def extract_context(stix_object: Dict) -> Dict:
 
 def processed_stix_object(stix_object: Dict) -> Dict:
     """Process stix2 object by adjusting some fields."""
-
     # set name to first value in pattern
     if stix_object["type"] == "indicator" and "pattern" in stix_object:
         ioc_type = stix_object.get("name", "")
         pattern = stix_object["pattern"]
+
+        match = re.search(r"\[(.+?):.*'(.*?)\'\]", pattern)
+        if match is not None:
+            if match[1] == "ipv4-addr":
+                stix_object["x_opencti_main_observable_type"] = "IPv4-Addr"
+            elif match[1] == "ipv6-addr":
+                stix_object["x_opencti_main_observable_type"] = "IPv6-Addr"
+            elif match[1] == "file":
+                stix_object["x_opencti_main_observable_type"] = "File"
+            elif match[1] == "domain-name":
+                stix_object["x_opencti_main_observable_type"] = "Domain-Name"
+            elif match[1] == "url":
+                stix_object["x_opencti_main_observable_type"] = "Url"
+            elif match[1] == "email-addr":
+                stix_object["x_opencti_main_observable_type"] = "Email-Addr"
+
         if ioc_type == "URL" and " LIKE " in pattern[:pattern.find("'")]:
             stix_object["name"] = extract_first_quoted_word(pattern).replace("%", "*").replace("_", "?")
         else:
@@ -102,7 +118,7 @@ class Stix21Transformer(Stix21Source):
     context and generate additional objects from the context.
     """
 
-    def __init__(self, source: Stix21Source):
+    def __init__(self, source: Stix21Source, expand_objects: bool, create_indicators: bool, create_observables: bool):
         """
             Initialize stix 2.1 transformer.
         :param source: source of stix 2.1 objects.
@@ -111,15 +127,20 @@ class Stix21Transformer(Stix21Source):
         self._source = source
         self._author = create_author()
         self._enumerated_objects = set()
-        self._transforms = [
-            ActorsTransform(author=self._author),
-            IndicatorsTransform(author=self._author),
-            IndustriesTransform(author=self._author),
-            LocationsTransform(author=self._author),
-            MalwaresTransform(author=self._author),
-            ReportsTransform(author=self._author),
-            ObservableTransform(author=self._author),
-        ]
+        self._create_indicators = create_indicators
+        if expand_objects:
+            self._transforms = [
+                ActorsTransform(author=self._author),
+                IndicatorsTransform(author=self._author, link_with_observables=create_observables and not create_indicators),
+                IndustriesTransform(author=self._author),
+                LocationsTransform(author=self._author),
+                MalwaresTransform(author=self._author),
+                ReportsTransform(author=self._author),
+            ]
+            if create_observables:
+                self._transforms.append(ObservableTransform(author=self._author))
+        else:
+            self._transforms = []
 
     def enumerate(self, added_after: datetime = None) -> Generator[Dict, None, None]:
         """
@@ -127,12 +148,9 @@ class Stix21Transformer(Stix21Source):
         :param added_after: datetime filter to skip old objects (optional).
         :return: generator of the stix items.
         """
-        is_first_object = True
-        for stix_object in self._source.enumerate(added_after):
-            if is_first_object:
-                is_first_object = False
-                yield self._author
+        yield self._author
 
+        for stix_object in self._source.enumerate(added_after):
             object_type = stix_object["type"]
             if object_type != "indicator":
                 yield stix_object
@@ -151,14 +169,22 @@ class Stix21Transformer(Stix21Source):
             stix_relationships = []
             if len(stix_objects) > 1:
                 for transform in self._transforms:
-                    stix_relationships.extend(
-                        transform.build_relationships(stix_objects)
-                    )
+                    if self._create_indicators:
+                        stix_relationships.extend(
+                            transform.build_relationships(stix_objects)
+                        )
+                    else:
+                        # do not create relationships for indicators
+                        # because they are not created
+                        stix_relationships.extend(
+                            transform.build_relationships(stix_objects[1:])
+                        )
 
             # note: the first object is original indicator and we
             # don't want to use self._enumerated_objects filter for
             # it, so we handle it separetly.
-            yield processed_stix_object(stix_objects[0])
+            if self._create_indicators:
+                yield processed_stix_object(stix_objects[0])
 
             for stix_object in stix_objects[1:]:
                 object_id = stix_object["id"]
@@ -170,6 +196,10 @@ class Stix21Transformer(Stix21Source):
 
             for stix_relationship in stix_relationships:
                 yield stix_relationship
+
+        for transform in self._transforms:
+            for stix_object in transform.finalize_objects():
+                yield processed_stix_object(stix_object)
 
         # cleanup allocated resources
         self._enumerated_objects = set()

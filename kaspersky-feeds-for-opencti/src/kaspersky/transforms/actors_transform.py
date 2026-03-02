@@ -61,7 +61,7 @@ class ActorsTransform(Transform):
             if PYCTI_VERSION >= v.parse("6.4.0"):
                 obj_id = ThreatActor.generate_id(actor_name, 'threat-actor')
             else:
-                obj_id = ThreatActor.generate_id(actor_name),
+                obj_id = ThreatActor.generate_id(actor_name)
 
             stix_object = stix2.v21.ThreatActor(
                 id=obj_id,

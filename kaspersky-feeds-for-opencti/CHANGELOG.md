@@ -1,9 +1,33 @@
 # What's new in Kaspersky TI connector for OpenCTI
-## [1.1.0] - 2025-12-06  
+
+## [1.1.1] - 2026-03-01
+ 
+### Performance
+- Send STIX 2.1 objects to OpenCTI in bundles of up to 1000 objects per request (instead of sending one object per request), improving ingestion speed for large datasets.
+ 
+### OpenCTI metadata
+- Indicators now include `x_opencti_main_observable_type` derived from the STIX pattern (IPv4-Addr, IPv6-Addr, File, Domain-Name, Url, Email-Addr) to improve OpenCTI classification/display.
+ 
+### Threat score handling
+- Added `connector.threat_score_from_description`: when enabled, `x_opencti_score` is taken from `threat_score=` inside `description` (or `x_opencti_description`), and threat-score labels are not generated (`threat_score:kaspersky:high|medium|low`).
+ 
+### Indicator/observable creation switch
+- Added (and wired) `kaspersky.create_indicators` and `kaspersky.create_observables` (effective when `kaspersky.expand_objects: true`):
+  - `create_indicators: false` disables emitting Indicator objects.
+  - `create_observables: false` disables generating Observables from indicator patterns.
+  - In observables-only mode (`create_indicators: false`, `create_observables: true`), relationships that were previously created from Indicators are created from the generated Observable (File, DomainName, URL, IPv4Address) to preserve links to related entities.
+
+### Reliability
+- Fixed state persistence for one-shot runs (`connector.run_and_terminate: true`) by forcing state synchronization with OpenCTI before process exit.
+- Improved incremental watermark handling: the state now advances at least to run start time, preventing repeated imports when feed metadata timestamps do not track TAXII `added_after` semantics.
+- Reduced noisy retries for normal no-data polling: TAXII `404` responses for empty `added_after` windows are no longer retried.
+- Fixed threat-actor ID generation path for `pycti < 6.4` in `actors_transform` (legacy compatibility path).
+
+## [1.1.0] - 2025-12-06
 
 ### Upgrade notes
 
-This release changes how indicators, observables, relationships and TAXII incremental collection windows are handled.  
+This release changes how indicators, observables, relationships and TAXII incremental collection windows are handled.
 To make sure your OpenCTI graph is consistent and no data is lost, you **must** reinitialize the connector after upgrading:
 
 - stop the existing connector instance
@@ -40,7 +64,7 @@ To make sure your OpenCTI graph is consistent and no data is lost, you **must** 
 
 ### Threat score and tagging
 
-- A single `connector.threat_score` parameter now controls the `x_opencti_score` assigned to all created indicators and their related observables (URLs, IPs, hashes, etc.).  
+- A single `connector.threat_score` parameter now controls the `x_opencti_score` assigned to all created indicators and their related observables (URLs, IPs, hashes, etc.).
   If you configure the score as `80`, all newly created indicators will receive `x_opencti_score = 80`, regardless of type.
 - The `connector.threat_score_high` and `connector.threat_score_medium` thresholds drive automatic threat-level tags:
   - `threat_score:kaspersky:high`
@@ -73,14 +97,14 @@ To make sure your OpenCTI graph is consistent and no data is lost, you **must** 
 
 The following parameters are available in `config.yml` and via environment variables:
 
-- `connector.confidence_level`  
+- `connector.confidence_level`
   Controls the `confidence` value for entities and relationships created by the connector.
 
-- `connector.threat_score`  
+- `connector.threat_score`
   Controls the `x_opencti_score` assigned to all created indicators.
 
-- `connector.threat_score_high`, `connector.threat_score_medium`  
+- `connector.threat_score_high`, `connector.threat_score_medium`
   Define thresholds used to assign threat-level tags (`threat_score:kaspersky:high/medium/low`).
 
-- `kaspersky.connection_timeout`  
+- `kaspersky.connection_timeout`
   HTTP timeout for TAXII requests in seconds; used by all TAXII client operations, with automatic retries on failures.

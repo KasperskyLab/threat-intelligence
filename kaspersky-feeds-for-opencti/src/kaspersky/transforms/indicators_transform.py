@@ -30,8 +30,20 @@ from .utils import (
 class IndicatorsTransform(Transform):
     """Transform for indicators."""
 
+    def __init__(self, author: Dict, link_with_observables: bool = False):
+        super().__init__(author=author)
+        self.link_with_observables = link_with_observables
+
     def build_relationships(self, stix_objects: List[Dict]) -> List[Dict]:
-        indicators = filter(lambda object: object["type"] == "indicator", stix_objects)
+        if self.link_with_observables:
+            indicators = filter(lambda object: object["type"] in [
+                "file",
+                "domain-name",
+                "url",
+                "ipv4-addr"
+            ], stix_objects)
+        else:
+            indicators = filter(lambda object: object["type"] == "indicator", stix_objects)
 
         relationships = []
         for indicator in indicators:
@@ -44,7 +56,7 @@ class IndicatorsTransform(Transform):
                         build_relationship(
                             source=indicator,
                             target=stix_object,
-                            link_type="indicates",
+                            link_type="indicates" if not self.link_with_observables else "related-to",
                             created_by_ref=self._author["id"],
                             description=indicator.get("description", ""),
                             labels=indicator.get("labels", []),
@@ -89,7 +101,7 @@ class IndicatorsTransform(Transform):
                             )
                         )
 
-                elif object_type in ["file", "domain-name", "url", "ipv4-addr"]:
+                elif not self.link_with_observables and object_type in ["file", "domain-name", "url", "ipv4-addr"]:
                     relationships.append(
                         build_relationship(
                             source=indicator,

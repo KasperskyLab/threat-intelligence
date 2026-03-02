@@ -50,6 +50,10 @@ def build_external_reference(
 class ReportsTransform(Transform):
     """Transform for reports."""
 
+    def __init__(self, author: Dict):
+        super().__init__(author=author)
+        self.reports = {}
+
     def build_objects(self, indicator: Dict, context: Dict) -> List[Dict]:
         if "publication_name" not in context:
             return []
@@ -57,8 +61,9 @@ class ReportsTransform(Transform):
         report_name = context["publication_name"]
         report_uuid = context.get("api_publication_id", None)
         report_timestamp = context.get("detection_date", "1900-01-01T00:00:00.000Z")
+        report_id=Report.generate_id(name=report_name, published=report_timestamp)
         stix_object = stix2.v21.Report(
-            id=Report.generate_id(name=report_name, published=report_timestamp),
+            id=report_id,
             name=report_name,
             published=report_timestamp,
             report_types=["indicator"],
@@ -68,7 +73,13 @@ class ReportsTransform(Transform):
                 report_name=report_name, report_uuid=report_uuid
             ),
         )
-        return [json.loads(stix_object.serialize())]
+        if report_id not in self.reports:
+            report=json.loads(stix_object.serialize())
+            report["object_refs"] = []
+            self.reports[report_id]=report
+            return [report]
+
+        return [self.reports[report_id]]
 
     def build_relationships(self, stix_objects: List[Dict]) -> List[Dict]:
         linked_types = ["threat-actor", "indicator"]
@@ -82,12 +93,25 @@ class ReportsTransform(Transform):
                 report_types.add(object_type)
                 continue
 
+        if "indicator" not in report_types:
+            linked_types = ["file", "domain-name", "url", "ipv4-addr"]
+            for stix_object in stix_objects:
+                object_type = stix_object["type"]
+                if object_type in linked_types:
+                    object_refs.append(stix_object["id"])
+                    report_types.add(object_type)
+
         if len(object_refs) == 0:
             return []
 
         reports = filter(lambda object: object["type"] == "report", stix_objects)
         for report in reports:
-            report["object_refs"] = object_refs
-            report["report_types"] = list(report_types)
+            report["object_refs"].extend(object_refs)
+            for type in report_types:
+                if type not in report["report_types"]:
+                    report["report_types"].append(type)
 
         return []
+
+    def finalize_objects(self) -> List[Dict]:
+        return list(self.reports.values())

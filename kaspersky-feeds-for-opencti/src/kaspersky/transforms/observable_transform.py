@@ -30,6 +30,10 @@ HASH_PATTERN = re.compile(
     r"file:hashes\.'?(MD5|SHA-1|SHA-256)'? ?= ?'([a-fA-F0-9]{32,64})'"
 )
 
+IP_PATTERN = re.compile(
+    r"^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$"
+)
+
 def extract_file_hashes(pattern: str):
     hashes = {}
     # Find all hash occurrences in the pattern
@@ -77,19 +81,21 @@ class ObservableTransform(Transform):
             stix_observ_arr.append(stix2.v21.File(
                 hashes=extract_file_hashes(stix_indicator["pattern"]), **shared
             ))
-        elif ioc_type == "URL":
-            if "domain-name:value" in stix_indicator["pattern"]:
+        elif ioc_type == "URL" or ioc_type == "IP":
+            first_word = extract_first_quoted_word(stix_indicator["pattern"])
+            match = IP_PATTERN.match(first_word)
+            if match:
+                stix_observ_arr.append(stix2.v21.IPv4Address(
+                    value=first_word, **shared
+                ))
+            elif "domain-name:value" in stix_indicator["pattern"]:
                 stix_observ_arr.append(stix2.v21.DomainName(
-                    value=extract_first_quoted_word(stix_indicator["pattern"]), **shared
+                    value=first_word, **shared
                 ))
             else:
                 stix_observ_arr.append(stix2.v21.URL(
-                    value=extract_first_quoted_word(stix_indicator["pattern"]), **shared
+                    value=first_word, **shared
                 ))
-        elif ioc_type == "IP":
-            stix_observ_arr.append(stix2.v21.IPv4Address(
-                value=extract_first_quoted_word(stix_indicator["pattern"]), **shared
-            ))
         elif ioc_type == "Exploit":
             for hashes in extract_multiple_file_hashes(stix_indicator["pattern"]):
                 stix_observ_arr.append(stix2.v21.File(
