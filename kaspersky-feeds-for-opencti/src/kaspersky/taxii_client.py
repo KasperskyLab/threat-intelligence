@@ -27,6 +27,12 @@ from requests import Session
 from taxii2client.common import _HTTPConnection
 from taxii2client.v21 import ApiRoot, Collection, as_pages
 
+from .label_utils import (
+    SUPPORTED_LABEL_FORMATS,
+    append_unique_labels,
+    get_feed_labels,
+    get_malicious_activity_labels,
+)
 from .stix_source import Stix21Source
 
 class Taxii21Session:
@@ -118,25 +124,28 @@ class Taxii21Logger:
         # pylint: disable-next=unnecessary-pass
         pass
 
-
-def make_feed_label(name: str) -> str:
-    """Create label from TAXII collection name."""
-    return name.removeprefix("TAXII_").lower()
-
-def replace_string_in_array(array, old_string, new_string):
-    """Replaces all occurrences of a old string with a new string in an array."""
-    return [new_string if item == old_string else item for item in array]
-
-def processed_stix_object(collection: str, stix_object: Dict) -> Dict:
+def processed_stix_object(
+    collection: str, stix_object: Dict, label_format: str = "legacy"
+) -> Dict:
     """Process stix2 object by adjusting some fields."""
     object_type = stix_object["type"]
     if object_type not in ["observable", "indicator"]:
         return stix_object
 
-    if "labels" not in stix_object:
-        stix_object["labels"] = []
-    stix_object["labels"] = replace_string_in_array(stix_object["labels"], "malicious-activity", "malicious-activity:kaspersky")
-    stix_object["labels"].append(make_feed_label(collection))
+    labels = stix_object.get("labels", [])
+    processed_labels = []
+    for label in labels:
+        if label == "malicious-activity":
+            processed_labels = append_unique_labels(
+                processed_labels, get_malicious_activity_labels(label_format)
+            )
+        else:
+            processed_labels = append_unique_labels(processed_labels, [label])
+
+    stix_object["labels"] = append_unique_labels(
+        processed_labels,
+        get_feed_labels(collection, label_format),
+    )
 
     if "valid_until" in stix_object:
         timestamp = stix_object["valid_until"]
@@ -162,6 +171,7 @@ class Taxii21Client(Stix21Source):
         collections: List[str] = None,
         timeout: int = None,
         logger: Any = None,
+        label_format: str = "legacy",
     ):
         """
             Initialize taxii 2.1 client object.
@@ -189,6 +199,9 @@ class Taxii21Client(Stix21Source):
         self._api = ApiRoot(url=f"{api_root}", conn=connection)
         self._collections = collections
         self._logger = logger if logger is not None else Taxii21Logger()
+        if label_format not in SUPPORTED_LABEL_FORMATS:
+            raise RuntimeError(f"Unsupported label format: {label_format}")
+        self._label_format = label_format
 
     @staticmethod
     def _collection_matched(collection: Collection, expectaions: List[str]) -> bool:
@@ -267,7 +280,9 @@ class Taxii21Client(Stix21Source):
                     objects_count += len(envelop["objects"])
                     for stix_object in envelop["objects"]:
                         yield processed_stix_object(
-                            collection=collection.title, stix_object=stix_object
+                            collection=collection.title,
+                            stix_object=stix_object,
+                            label_format=self._label_format,
                         )
 
                 self._logger.log_info(

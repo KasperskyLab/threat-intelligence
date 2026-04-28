@@ -11,6 +11,8 @@ connector:
   threat_score: 100
   threat_score_high: 75
   threat_score_medium: 50
+  label_format: 'legacy'
+  description_mode: 'overwrite'
   log_level: 'info'
   update_existing_data: false
   run_and_terminate: false

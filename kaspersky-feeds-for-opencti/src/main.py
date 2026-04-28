@@ -16,20 +16,26 @@
 """Kaspersky connector main module."""
 
 import os
-import re
 import sys
 import time
 import json
 import uuid
-import copy
+import signal
+from contextlib import contextmanager
 import argparse
-from typing import Dict, List
+import threading
+from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone, timedelta
 import urllib3
 import yaml
 
 from pycti import OpenCTIConnectorHelper
 from kaspersky import Taxii21Client, Stix21Source, Stix21Transformer
+from kaspersky.label_utils import (
+    SUPPORTED_LABEL_FORMATS as LABEL_FORMATS,
+    append_unique_labels,
+    get_threat_score_labels,
+)
 
 
 class Configuration:
@@ -37,6 +43,8 @@ class Configuration:
 
     CONFIG_FILE = "./config.yml"
     APPLICATION_NAMESPACE = "kaspersky"
+    SUPPORTED_LABEL_FORMATS = LABEL_FORMATS
+    SUPPORTED_DESCRIPTION_MODES = ("overwrite", "skip", "create_only")
     DEFAULT_CONFIGURATION = {
         "opencti.ssl_verify": True,
         "connector.type": "EXTERNAL_IMPORT",
@@ -49,6 +57,8 @@ class Configuration:
         "connector.threat_score_medium": 50,
         "connector.log_level": "info",
         "connector.update_existing_data": False,
+        "connector.label_format": "legacy",
+        "connector.description_mode": "overwrite",
         f"{APPLICATION_NAMESPACE}.api_root": "https://taxii.tip.kaspersky.com/v2",
         f"{APPLICATION_NAMESPACE}.connection_timeout": 60,
         f"{APPLICATION_NAMESPACE}.ssl_verify": True,
@@ -111,6 +121,22 @@ class Configuration:
         return self._read_bool(parameter)
 
     @property
+    def label_format(self) -> str:
+        """Label formatting mode for connector-authored labels."""
+        parameter = "connector.label_format"
+        return self._read_string_choice(
+            parameter, Configuration.SUPPORTED_LABEL_FORMATS
+        )
+
+    @property
+    def description_mode(self) -> str:
+        """Description handling mode for outgoing objects."""
+        parameter = "connector.description_mode"
+        return self._read_string_choice(
+            parameter, Configuration.SUPPORTED_DESCRIPTION_MODES
+        )
+
+    @property
     def expand_objects(self) -> bool:
         """Whether to expand downloading objects."""
         parameter = f"{Configuration.APPLICATION_NAMESPACE}.expand_objects"
@@ -141,11 +167,11 @@ class Configuration:
 
     def __str__(self) -> str:
         """Format configuration as string."""
-        masked_config = copy.deepcopy(self._config)
-        for _, section in masked_config.items():
-            for key, _ in section.items():
-                if "token" in key:
-                    section[key] = "*****"
+        masked_config = {}
+        for namespace, section in self._config.items():
+            masked_config[namespace] = {}
+            for key, value in section.items():
+                masked_config[namespace][key] = "*****" if "token" in key else value
         return str(masked_config)
 
     def _read_bool(self, field_name: str) -> bool:
@@ -170,6 +196,17 @@ class Configuration:
         """Read specified field as string."""
         value = self._read_raw_value(field_name, is_number=False)
         return str(value) if value is not None else None
+
+    def _read_string_choice(self, field_name: str, choices: Tuple[str, ...]) -> str:
+        """Read specified field as string and validate allowed values."""
+        value = self._read_string(field_name)
+        if value is None:
+            return None
+        if value not in choices:
+            raise RuntimeError(
+                f"Invalid configuration: '{field_name}' contains invalid value: '{value}'. Supported values: {', '.join(choices)}"
+            )
+        return value
 
     def _read_string_list(self, field_name: str) -> List[str]:
         """Read specified field as string list."""
@@ -260,9 +297,58 @@ class Configuration:
         return merged_config
 
 
+class ConnectorStopRequested(BaseException):
+    """Signal-driven graceful stop request."""
+
+    def __init__(self, signal_name: str):
+        super().__init__(f"Connector stop requested by {signal_name}")
+        self.signal_name = signal_name
+
+
 # pylint: disable-next=too-few-public-methods
 class Connector:
     """Kaspersky TAXII Server connector for OpenCTI."""
+
+    CYBER_OBSERVABLE_TYPES = {
+        "artifact",
+        "autonomous-system",
+        "directory",
+        "domain-name",
+        "email-addr",
+        "email-message",
+        "file",
+        "hostname",
+        "ipv4-addr",
+        "ipv6-addr",
+        "mac-addr",
+        "mutex",
+        "network-traffic",
+        "process",
+        "software",
+        "url",
+        "user-account",
+        "windows-registry-key",
+        "x509-certificate",
+    }
+    DESCRIPTION_FIELDS = ("description", "x_opencti_description")
+    DESCRIPTION_LOOKUP_CHUNK_SIZE = 200
+    GRACEFUL_STOP_TIMEOUT_SEC = 5
+    TERMINAL_WORK_STATUSES = {"complete", "cancelled", "canceled"}
+    SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+    STIX_OBJECT_LOOKUP_ATTRIBUTES = """
+        ... on StixObject {
+            id
+            standard_id
+        }
+        ... on StixCoreRelationship {
+            id
+            standard_id
+        }
+        ... on StixSightingRelationship {
+            id
+            standard_id
+        }
+    """
 
     # pylint: disable-next=too-many-arguments
     def __init__(
@@ -273,6 +359,8 @@ class Connector:
         initial_history: int = None,
         update_existing_data: bool = None,
         dry_run: bool = None,
+        label_format: str = "legacy",
+        description_mode: str = "overwrite",
     ) -> None:
         self._opencti_api = opencti_api
         self._stix_source = stix_source
@@ -280,82 +368,151 @@ class Connector:
         self._initial_history = initial_history
         self._update_interval = update_interval
         self._dry_run = dry_run
+        self._label_format = label_format
+        self._description_mode = description_mode
+        self._known_existing_ids: Set[str] = set()
+        self._known_new_ids: Set[str] = set()
+        self._run_metrics: Dict[str, float] = {}
+        self._last_run_metrics: Dict[str, float] = {}
+        self._active_work_id: Optional[str] = None
+        self._active_work_finalized = False
+        self._active_work_objects_count = 0
+        self._shutdown_signal_name: Optional[str] = None
+        self._defer_stop_exception = False
+        self._graceful_shutdown_in_progress = False
+        self._reset_run_metrics()
+
+    def get_last_run_metrics(self) -> Dict[str, float]:
+        """Return metrics captured for the last completed run."""
+        return dict(self._last_run_metrics)
 
     def run(self) -> None:
         """Run connector execution."""
         self._opencti_api.log_info("Connector started")
         last_added = None
-
-        while True:
-            app_state = self._opencti_api.get_state()
-            first_launch = app_state is None or "last_added" not in app_state
-            if first_launch:
-                self._opencti_api.log_info("Connector has never run")
-                if self._initial_history is not None:
-                    last_added = datetime.now(timezone.utc) - timedelta(
-                        seconds=self._initial_history
+        previous_handlers = self._install_signal_handlers()
+        try:
+            while True:
+                work_id = None
+                self._reset_run_shutdown_state()
+                app_state = self._opencti_api.get_state()
+                first_launch = app_state is None or "last_added" not in app_state
+                if first_launch:
+                    self._opencti_api.log_info("Connector has never run")
+                    if self._initial_history is not None:
+                        last_added = datetime.now(timezone.utc) - timedelta(
+                            seconds=self._initial_history
+                        )
+                        self._opencti_api.log_info(
+                            "Connector initial timestamp: "
+                            + last_added.strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                else:
+                    last_added = datetime.fromtimestamp(
+                        float(app_state["last_added"]), timezone.utc
                     )
                     self._opencti_api.log_info(
-                        "Connector initial timestamp: "
+                        "Connector last added timestamp: "
                         + last_added.strftime("%Y-%m-%d %H:%M:%S")
                     )
-            else:
-                last_added = datetime.fromtimestamp(float(app_state["last_added"]), timezone.utc)
-                self._opencti_api.log_info(
-                    "Connector last added timestamp: "
-                    + last_added.strftime("%Y-%m-%d %H:%M:%S")
-                )
 
-            try:
-                run_started_at = int(datetime.now(timezone.utc).timestamp())
-                objects_count = 0
-                timestamp = 0.0
+                run_wall_started_at = time.perf_counter()
+                self._known_existing_ids = set()
+                self._known_new_ids = set()
+                self._reset_run_metrics()
+                try:
+                    run_started_at_dt = datetime.now(timezone.utc)
+                    run_started_at = int(run_started_at_dt.timestamp())
+                    objects_count = 0
+                    timestamp = 0.0
+                    run_cancelled = False
 
-                for stix_batch in self._get_batches(self._stix_source.enumerate(added_after=last_added), 1000):
-                    for obj in stix_batch:
-                        # Update high-watermark from any object carrying source description.
-                        # This keeps incremental state progressing even when indicators are not emitted.
-                        object_description = obj.get("description") or obj.get("x_opencti_description") or ""
-                        timestamp = max(
-                            timestamp,
-                            self._get_date_added_ts_from_description(object_description),
-                        )
+                    if not self._dry_run:
+                        work_id = self._start_work(run_started_at_dt, last_added)
+                        self._active_work_id = work_id
+
+                    for stix_batch in self._get_batches(
+                        self._stix_source.enumerate(added_after=last_added), 1000
+                    ):
+                        self._raise_if_stop_requested()
+                        if work_id and not self._is_work_alive(work_id):
+                            run_cancelled = True
+                            self._active_work_finalized = True
+                            self._opencti_api.log_info(
+                                f"OpenCTI work {work_id} is no longer active. Stopping current run."
+                            )
+                            break
+
+                        batch_timestamp = self._get_batch_date_added_ts(stix_batch)
+                        self._run_metrics["batches_total"] += 1
+                        self._run_metrics["objects_total"] += len(stix_batch)
+                        if self._dry_run:
+                            self._print_object(stix_batch)
+                        else:
+                            self._run_with_deferred_stop(
+                                self._prepare_and_send_batch,
+                                stix_batch,
+                                work_id=work_id,
+                            )
+                        timestamp = max(timestamp, batch_timestamp)
+                        objects_count += len(stix_batch)
+                        self._active_work_objects_count = objects_count
+                        self._raise_if_stop_requested()
+
                     if self._dry_run:
-                        self._print_object(stix_batch)
+                        self._opencti_api.log_info(
+                            f"Connector sent {objects_count} objects (dry run executed)"
+                        )
+
+                    elif run_cancelled:
+                        self._opencti_api.log_info(
+                            f"Connector run cancelled after queueing {objects_count} objects"
+                        )
+
                     else:
-                        self._send_objects(stix_batch)
-                    objects_count += len(stix_batch)
+                        state_timestamp = run_started_at
+                        if timestamp > state_timestamp:
+                            state_timestamp = timestamp
+                        self._opencti_api.set_state(
+                            {"last_added": int(state_timestamp)}
+                        )
+                        self._sync_state()
+                        self._finalize_active_work(
+                            f"Connector queued {objects_count} objects for import"
+                        )
+                        self._opencti_api.log_info(
+                            f"Connector queued {objects_count} objects for import"
+                        )
 
-                if self._dry_run:
-                    self._opencti_api.log_info(
-                        f"Connector sent {objects_count} objects (dry run executed)"
+                # pylint: disable-next=broad-exception-caught
+                except Exception as run_exception:
+                    self._finalize_active_work(
+                        f"Connector run failed: {run_exception}",
+                        in_error=True,
+                    )
+                    self._opencti_api.log_error(
+                        f"Error occurred during connector execution: {run_exception}"
+                    )
+                finally:
+                    self._finalize_run_metrics(
+                        time.perf_counter() - run_wall_started_at
                     )
 
-                else:
-                    state_timestamp = run_started_at
-                    if timestamp > state_timestamp:
-                        state_timestamp = timestamp
-                    self._opencti_api.set_state({"last_added": int(state_timestamp)})
-                    self._sync_state()
-                    self._opencti_api.log_info(
-                        f"Connector sent {objects_count} objects"
-                    )
+                self._reset_run_shutdown_state()
+                if self._opencti_api.connect_run_and_terminate:
+                    self._opencti_api.log_info("Run Complete. Stopping connector...")
+                    sys.exit(0)
 
-            # pylint: disable-next=broad-exception-caught
-            except Exception as run_exception:
-                self._opencti_api.log_error(
-                    f"Error occurred during connector execution: {run_exception}"
+                self._opencti_api.log_info(
+                    f"Run Complete. Sleeping until next run in {self._update_interval} seconds"
                 )
-
-            if self._opencti_api.connect_run_and_terminate:
-                self._opencti_api.log_info("Run Complete. Stopping connector...")
-                sys.exit(0)
-
-            self._opencti_api.log_info(
-                f"Run Complete. Sleeping until next run in "
-                f"{self._update_interval} seconds"
-            )
-            time.sleep(self._update_interval)
+                time.sleep(self._update_interval)
+        except ConnectorStopRequested as stop_requested:
+            self._handle_graceful_stop(stop_requested)
+            self._reset_run_shutdown_state()
+            sys.exit(0)
+        finally:
+            self._restore_signal_handlers(previous_handlers)
 
     def _get_batches(self, stix_objects, size: int):
         batch = []
@@ -432,13 +589,23 @@ class Connector:
         if labels_key not in stix_object:
             stix_object[labels_key] = []
         if "threat_score=" not in description:
-            stix_object[labels_key].append(self._calc_threat_score_label(default_threat_score, threat_score_high, threat_score_medium))
+            stix_object[labels_key] = append_unique_labels(
+                stix_object[labels_key],
+                self._calc_threat_score_labels(
+                    default_threat_score, threat_score_high, threat_score_medium
+                ),
+            )
             return stix_object
 
         for record in str(description).split(";"):
             parts = record.split("=")
             if parts[0] == "threat_score":
-                stix_object[labels_key].append(self._calc_threat_score_label(int(parts[1]), threat_score_high, threat_score_medium))
+                stix_object[labels_key] = append_unique_labels(
+                    stix_object[labels_key],
+                    self._calc_threat_score_labels(
+                        int(parts[1]), threat_score_high, threat_score_medium
+                    ),
+                )
 
         return stix_object
 
@@ -446,7 +613,7 @@ class Connector:
         for obj in stix_objects:
             print(json.dumps(obj))
 
-    def _send_objects(self, stix_objects: List) -> None:
+    def _send_objects(self, stix_objects: List, work_id: Optional[str] = None) -> None:
         for obj in stix_objects:
             self._opencti_api.log_debug(f"Sending object: {obj}")
         self._opencti_api.send_stix2_bundle(
@@ -459,7 +626,193 @@ class Connector:
                 }
             ),
             update=self._update_existing_data,
+            work_id=work_id,
         )
+
+    def _prepare_and_send_batch(
+        self, stix_objects: List[Dict], work_id: Optional[str] = None
+    ) -> None:
+        self._prepare_batch_for_send(stix_objects)
+        self._send_objects(stix_objects, work_id=work_id)
+
+    def _prepare_batch_for_send(self, stix_objects: List[Dict]) -> List[Dict]:
+        if self._description_mode == "overwrite":
+            return stix_objects
+
+        objects_with_description = [
+            stix_object for stix_object in stix_objects if self._has_description(stix_object)
+        ]
+        if not objects_with_description:
+            return stix_objects
+
+        if self._description_mode == "skip":
+            self._strip_descriptions(objects_with_description)
+            return stix_objects
+
+        if self._description_mode == "create_only":
+            self._apply_create_only_description_mode(objects_with_description)
+            return stix_objects
+
+        return stix_objects
+
+    def _apply_create_only_description_mode(self, stix_objects: List[Dict]) -> None:
+        pending_objects: Dict[str, List[Dict]] = {}
+        for stix_object in stix_objects:
+            object_id = stix_object.get("id")
+            if object_id is None:
+                self._log_description_skip(stix_object, "missing-id")
+                self._strip_descriptions([stix_object])
+                continue
+
+            if object_id in self._known_new_ids:
+                continue
+            if object_id in self._known_existing_ids:
+                self._strip_descriptions([stix_object])
+                continue
+
+            pending_objects.setdefault(object_id, []).append(stix_object)
+
+        if not pending_objects:
+            return
+
+        pending_ids = list(pending_objects.keys())
+        try:
+            existing_ids = self._prefetch_existing_object_ids(pending_ids)
+        except Exception as exception:
+            sample_object = next(iter(pending_objects.values()))[0]
+            pending_count = sum(len(objects) for objects in pending_objects.values())
+            self._log_description_batch_skip(
+                sample_object=sample_object,
+                count=pending_count,
+                reason=str(exception),
+            )
+            for objects in pending_objects.values():
+                self._strip_descriptions(objects)
+            return
+
+        self._known_existing_ids.update(existing_ids)
+        self._known_new_ids.update(set(pending_ids) - existing_ids)
+
+        for object_id, objects in pending_objects.items():
+            if object_id in existing_ids:
+                self._strip_descriptions(objects)
+
+    def _prefetch_existing_object_ids(self, object_ids: List[str]) -> Set[str]:
+        api_client = getattr(self._opencti_api, "api", None)
+        if api_client is None:
+            raise RuntimeError("OpenCTI API client is unavailable")
+
+        reader = getattr(api_client, "opencti_stix_object_or_stix_relationship", None)
+        if reader is None or not hasattr(reader, "list"):
+            raise RuntimeError(
+                "OpenCTI batched existence lookup is unavailable"
+            )
+
+        existing_ids: Set[str] = set()
+        for chunk in self._chunk_values(object_ids, Connector.DESCRIPTION_LOOKUP_CHUNK_SIZE):
+            self._run_metrics["existence_lookup_calls"] += 1
+            self._run_metrics["existence_lookup_ids_total"] += len(chunk)
+            result = reader.list(
+                filters=self._build_ids_filter(chunk),
+                first=len(chunk),
+                getAll=True,
+                customAttributes=Connector.STIX_OBJECT_LOOKUP_ATTRIBUTES,
+            )
+            requested_ids = set(chunk)
+            for item in result or []:
+                for key in ("id", "standard_id"):
+                    candidate_id = item.get(key)
+                    if candidate_id in requested_ids:
+                        existing_ids.add(candidate_id)
+
+        return existing_ids
+
+    def _log_description_skip(self, stix_object: Dict, reason: str) -> None:
+        object_type = stix_object.get("type", "<unknown>")
+        object_id = stix_object.get("id", "<missing>")
+        self._opencti_api.log_warning(
+            f"skip description mode=create_only type={object_type} id={object_id} reason={reason}"
+        )
+
+    def _log_description_batch_skip(
+        self, sample_object: Dict, count: int, reason: str
+    ) -> None:
+        sample_type = sample_object.get("type", "<unknown>")
+        sample_id = sample_object.get("id", "<missing>")
+        self._opencti_api.log_warning(
+            f"skip descriptions mode=create_only count={count} reason={reason} sample={sample_type}:{sample_id}"
+        )
+
+    def _strip_descriptions(self, stix_objects: List[Dict]) -> None:
+        for stix_object in stix_objects:
+            if self._has_description(stix_object):
+                self._strip_description_fields(stix_object)
+                self._run_metrics["descriptions_stripped_total"] += 1
+
+    @staticmethod
+    def _has_description(stix_object: Dict) -> bool:
+        return any(field in stix_object for field in Connector.DESCRIPTION_FIELDS)
+
+    @staticmethod
+    def _strip_description_fields(stix_object: Dict) -> Dict:
+        for field_name in Connector.DESCRIPTION_FIELDS:
+            stix_object.pop(field_name, None)
+        return stix_object
+
+    @staticmethod
+    def _chunk_values(values: List[str], chunk_size: int) -> List[List[str]]:
+        return [
+            values[index : index + chunk_size]
+            for index in range(0, len(values), chunk_size)
+        ]
+
+    @staticmethod
+    def _build_ids_filter(object_ids: List[str]) -> Dict:
+        return {
+            "mode": "and",
+            "filterGroups": [],
+            "filters": [
+                {
+                    "key": "ids",
+                    "mode": "or",
+                    "values": object_ids,
+                }
+            ],
+        }
+
+    def _reset_run_metrics(self) -> None:
+        self._run_metrics = {
+            "objects_total": 0,
+            "batches_total": 0,
+            "existence_lookup_calls": 0,
+            "existence_lookup_ids_total": 0,
+            "descriptions_stripped_total": 0,
+        }
+
+    def _finalize_run_metrics(self, wall_time_sec: float) -> None:
+        self._last_run_metrics = dict(self._run_metrics)
+        self._last_run_metrics["sync_wall_time_sec"] = wall_time_sec
+        self._last_run_metrics["objects_per_sec"] = (
+            self._run_metrics["objects_total"] / wall_time_sec if wall_time_sec > 0 else 0.0
+        )
+        self._last_run_metrics["avg_lookup_chunk_size"] = (
+            self._run_metrics["existence_lookup_ids_total"]
+            / self._run_metrics["existence_lookup_calls"]
+            if self._run_metrics["existence_lookup_calls"] > 0
+            else 0.0
+        )
+
+    def _get_batch_date_added_ts(self, stix_objects: List) -> float:
+        timestamp = 0.0
+        for obj in stix_objects:
+            # Update high-watermark from any object carrying source description.
+            # This keeps incremental state progressing even when indicators are not emitted.
+            object_description = obj.get("description") or obj.get("x_opencti_description") or ""
+            timestamp = max(
+                timestamp,
+                self._get_date_added_ts_from_description(object_description),
+            )
+        return timestamp
 
     def _get_date_added_ts_from_description(self, description: str) -> float:
         date_added_ts = 0.0
@@ -493,14 +846,258 @@ class Connector:
                     f"Unable to synchronize connector state: {exception}"
                 )
 
+    def _start_work(
+        self, run_started_at: datetime, last_added: Optional[datetime]
+    ) -> Optional[str]:
+        work_api = self._get_work_api()
+        connector_id = getattr(self._opencti_api, "connector_id", None)
+        if work_api is None or connector_id is None:
+            return None
+
+        try:
+            work_id = work_api.initiate_work(
+                connector_id,
+                self._build_work_name(run_started_at, last_added),
+            )
+        except Exception as exception:
+            self._opencti_api.log_warning(
+                f"Unable to initiate OpenCTI work tracking: {exception}"
+            )
+            return None
+
+        if work_id:
+            try:
+                work_api.to_received(
+                    work_id, "Connector started the synchronization run"
+                )
+            except Exception as exception:
+                self._opencti_api.log_warning(
+                    f"Unable to mark OpenCTI work as received: {exception}"
+                )
+        return work_id
+
+    def _complete_work(
+        self, work_id: Optional[str], message: str, in_error: bool = False
+    ) -> None:
+        if work_id is None:
+            return
+
+        work_api = self._get_work_api()
+        if work_api is None:
+            return
+
+        try:
+            work_api.to_processed(work_id, message, in_error)
+        except Exception as exception:
+            self._opencti_api.log_warning(
+                f"Unable to finalize OpenCTI work {work_id}: {exception}"
+            )
+
+    def _finalize_active_work(self, message: str, in_error: bool = False) -> None:
+        if self._active_work_id is None or self._active_work_finalized:
+            return
+
+        self._complete_work(self._active_work_id, message, in_error)
+        self._active_work_finalized = True
+
+    def _handle_graceful_stop(self, stop_requested: ConnectorStopRequested) -> None:
+        signal_name = stop_requested.signal_name
+        self._graceful_shutdown_in_progress = True
+        self._opencti_api.log_info(
+            f"Connector received {signal_name}; finalizing graceful shutdown."
+        )
+
+        try:
+            if self._active_work_id and not self._active_work_finalized:
+                with self._temporary_graceful_stop_timeout():
+                    if self._is_work_alive(self._active_work_id):
+                        self._finalize_active_work(
+                            f"Connector run interrupted by {signal_name} "
+                            f"after queueing {self._active_work_objects_count} objects",
+                            in_error=True,
+                        )
+                    else:
+                        self._active_work_finalized = True
+        # pylint: disable-next=broad-exception-caught
+        except Exception as exception:
+            self._opencti_api.log_warning(
+                f"Graceful shutdown finalization failed: {exception}"
+            )
+        finally:
+            self._graceful_shutdown_in_progress = False
+
+        self._opencti_api.log_info("Connector graceful shutdown complete.")
+
+    def _handle_stop_signal(self, signum, _frame) -> None:
+        is_first_signal = self._shutdown_signal_name is None
+        if is_first_signal:
+            self._shutdown_signal_name = self._get_signal_name(signum)
+        if (
+            self._defer_stop_exception
+            or self._graceful_shutdown_in_progress
+            or not is_first_signal
+        ):
+            return
+        raise ConnectorStopRequested(self._shutdown_signal_name)
+
+    def _install_signal_handlers(self) -> Dict[int, object]:
+        if threading.current_thread() is not threading.main_thread():
+            self._opencti_api.log_warning(
+                "Connector.run() is not executing in the main thread; "
+                "signal-based graceful shutdown is disabled for this run."
+            )
+            return {}
+
+        previous_handlers = {}
+        for signum in Connector.SHUTDOWN_SIGNALS:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle_stop_signal)
+        return previous_handlers
+
     @staticmethod
-    def _calc_threat_score_label(score: int, score_high: int, score_medium: int) -> str:
+    def _restore_signal_handlers(previous_handlers: Dict[int, object]) -> None:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+    def _reset_run_shutdown_state(self) -> None:
+        self._active_work_id = None
+        self._active_work_finalized = False
+        self._active_work_objects_count = 0
+        self._shutdown_signal_name = None
+        self._defer_stop_exception = False
+        self._graceful_shutdown_in_progress = False
+
+    def _run_with_deferred_stop(self, callback, *args, **kwargs):
+        self._defer_stop_exception = True
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            self._defer_stop_exception = False
+
+    def _raise_if_stop_requested(self) -> None:
+        if self._shutdown_signal_name is None:
+            return
+        raise ConnectorStopRequested(self._shutdown_signal_name)
+
+    @staticmethod
+    def _get_signal_name(signum: int) -> str:
+        try:
+            return signal.Signals(signum).name
+        except ValueError:
+            return f"SIGNAL-{signum}"
+
+    @contextmanager
+    def _temporary_graceful_stop_timeout(self):
+        timeout_clients = []
+        for client_name in ("api", "api_impersonate"):
+            api_client = getattr(self._opencti_api, client_name, None)
+            if api_client is None or not hasattr(api_client, "session_requests_timeout"):
+                continue
+
+            original_timeout = api_client.session_requests_timeout
+            adjusted_timeout = Connector.GRACEFUL_STOP_TIMEOUT_SEC
+            if isinstance(original_timeout, (int, float)) and original_timeout > 0:
+                adjusted_timeout = min(
+                    original_timeout, Connector.GRACEFUL_STOP_TIMEOUT_SEC
+                )
+            timeout_clients.append((api_client, original_timeout))
+            api_client.session_requests_timeout = adjusted_timeout
+
+        try:
+            yield
+        finally:
+            for api_client, original_timeout in timeout_clients:
+                api_client.session_requests_timeout = original_timeout
+
+    def _is_work_alive(self, work_id: str) -> bool:
+        work_api = self._get_work_api()
+        if work_api is None:
+            return True
+
+        get_is_work_alive = getattr(work_api, "get_is_work_alive", None)
+        if callable(get_is_work_alive):
+            try:
+                return bool(get_is_work_alive(work_id))
+            except Exception as exception:
+                self._opencti_api.log_warning(
+                    f"Unable to query OpenCTI work liveness for {work_id}: {exception}"
+                )
+                return True
+
+        get_work = getattr(work_api, "get_work", None)
+        if callable(get_work):
+            try:
+                return self._is_work_alive_from_state(get_work(work_id))
+            except Exception as exception:
+                if self._is_missing_work_error(exception):
+                    self._opencti_api.log_info(
+                        f"OpenCTI work {work_id} is no longer available: {exception}"
+                    )
+                    return False
+
+                self._opencti_api.log_warning(
+                    f"Unable to query OpenCTI work liveness for {work_id}: {exception}"
+                )
+                return True
+
+        return True
+
+    @classmethod
+    def _is_work_alive_from_state(cls, work_state: Optional[Dict]) -> bool:
+        if not work_state:
+            return False
+
+        status = str(work_state.get("status", "")).strip().lower()
+        if not status:
+            return True
+        return status not in cls.TERMINAL_WORK_STATUSES
+
+    @staticmethod
+    def _is_missing_work_error(exception: Exception) -> bool:
+        message = str(exception).strip().lower()
+        return any(
+            marker in message
+            for marker in (
+                "not found",
+                "no longer available",
+                "unknown work",
+                "does not exist",
+                "doesn't exist",
+            )
+        )
+
+    def _get_work_api(self):
+        api_client = getattr(self._opencti_api, "api", None)
+        return getattr(api_client, "work", None)
+
+    @staticmethod
+    def _build_work_name(
+        run_started_at: datetime, last_added: Optional[datetime]
+    ) -> str:
+        run_started_label = run_started_at.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+        if last_added is None:
+            return f"Kaspersky Feeds run @ {run_started_label}"
+
+        last_added_label = last_added.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+        return (
+            f"Kaspersky Feeds run @ {run_started_label} (added_after={last_added_label})"
+        )
+
+    def _calc_threat_score_labels(
+        self, score: int, score_high: int, score_medium: int
+    ) -> List[str]:
         if score >= score_high:
-            return "threat_score:kaspersky:high"
+            level = "high"
         elif score >= score_medium:
-            return "threat_score:kaspersky:medium"
+            level = "medium"
         else:
-            return "threat_score:kaspersky:low"
+            level = "low"
+
+        return get_threat_score_labels(level, self._label_format)
 
 
 if __name__ == "__main__":
@@ -533,6 +1130,8 @@ if __name__ == "__main__":
         opencti_client.log_info(
             "Feature flags: "
             f"connector.threat_score_from_description={config.all['connector']['threat_score_from_description']}, "
+            f"connector.label_format={config.label_format}, "
+            f"connector.description_mode={config.description_mode}, "
             f"kaspersky.expand_objects={config.expand_objects}, "
             f"kaspersky.create_indicators={config.create_indicators}, "
             f"kaspersky.create_observables={config.create_observables}"
@@ -570,6 +1169,7 @@ if __name__ == "__main__":
         collections=config.collections,
         timeout=config.connection_timeout,
         logger=opencti_client,
+        label_format=config.label_format,
     )
 
     stix_provider = Stix21Transformer(
@@ -586,5 +1186,7 @@ if __name__ == "__main__":
         update_interval=config.update_interval,
         update_existing_data=config.update_existing_data,
         dry_run=args.dry_run,
+        label_format=config.label_format,
+        description_mode=config.description_mode,
     )
     connector.run()

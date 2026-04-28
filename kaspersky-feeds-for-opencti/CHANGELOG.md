@@ -1,5 +1,14 @@
 # What's new in Kaspersky TI connector for OpenCTI
 
+## [1.1.2]
+
+### OpenCTI work tracking
+- Each synchronization run is now registered as a dedicated OpenCTI work/task, with work status, errors and completion details propagated to the platform UI.
+
+### Label and description controls
+- Added `connector.label_format` / `CONNECTOR_LABEL_FORMAT` with `legacy`, `new` and `both` modes for connector-authored labels on indicators and observables.
+- Added `connector.description_mode` / `CONNECTOR_DESCRIPTION_MODE` with `overwrite`, `skip` and `create_only` modes for outgoing descriptions.
+
 ## [1.1.1] - 2026-03-01
  
 ### Performance
