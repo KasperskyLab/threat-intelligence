@@ -121,6 +121,12 @@ class Configuration:
         return self._read_bool(parameter)
 
     @property
+    def threat_score_from_description(self) -> bool:
+        """Whether to read threat score from STIX description instead of labels."""
+        parameter = "connector.threat_score_from_description"
+        return self._read_bool(parameter)
+
+    @property
     def label_format(self) -> str:
         """Label formatting mode for connector-authored labels."""
         parameter = "connector.label_format"
@@ -339,6 +345,7 @@ class Connector:
         ... on StixObject {
             id
             standard_id
+            x_opencti_stix_ids
         }
         ... on StixCoreRelationship {
             id
@@ -361,6 +368,7 @@ class Connector:
         dry_run: bool = None,
         label_format: str = "legacy",
         description_mode: str = "overwrite",
+        threat_score_from_description: bool = False,
     ) -> None:
         self._opencti_api = opencti_api
         self._stix_source = stix_source
@@ -370,6 +378,7 @@ class Connector:
         self._dry_run = dry_run
         self._label_format = label_format
         self._description_mode = description_mode
+        self._threat_score_from_description = bool(threat_score_from_description)
         self._known_existing_ids: Set[str] = set()
         self._known_new_ids: Set[str] = set()
         self._run_metrics: Dict[str, float] = {}
@@ -447,7 +456,10 @@ class Connector:
                         self._run_metrics["batches_total"] += 1
                         self._run_metrics["objects_total"] += len(stix_batch)
                         if self._dry_run:
-                            self._print_object(stix_batch)
+                            self._run_with_deferred_stop(
+                                self._prepare_and_print_batch,
+                                stix_batch,
+                            )
                         else:
                             self._run_with_deferred_stop(
                                 self._prepare_and_send_batch,
@@ -491,7 +503,7 @@ class Connector:
                         in_error=True,
                     )
                     self._opencti_api.log_error(
-                        f"Error occurred during connector execution: {run_exception}"
+                       f"Error occurred during connector execution: {run_exception}"
                     )
                 finally:
                     self._finalize_run_metrics(
@@ -504,7 +516,7 @@ class Connector:
                     sys.exit(0)
 
                 self._opencti_api.log_info(
-                    f"Run Complete. Sleeping until next run in {self._update_interval} seconds"
+                   f"Run Complete. Sleeping until next run in {self._update_interval} seconds"
                 )
                 time.sleep(self._update_interval)
         except ConnectorStopRequested as stop_requested:
@@ -577,7 +589,7 @@ class Connector:
             description = stix_object["description"]
             labels_key = "labels"
 
-        if self._opencti_api.config["connector"]["threat_score_from_description"] == True:
+        if self._threat_score_from_description:
             if "threat_score=" in description:
                 for record in str(description).split(";"):
                     parts = record.split("=")
@@ -634,6 +646,10 @@ class Connector:
     ) -> None:
         self._prepare_batch_for_send(stix_objects)
         self._send_objects(stix_objects, work_id=work_id)
+
+    def _prepare_and_print_batch(self, stix_objects: List[Dict]) -> None:
+        self._prepare_batch_for_send(stix_objects)
+        self._print_object(stix_objects)
 
     def _prepare_batch_for_send(self, stix_objects: List[Dict]) -> List[Dict]:
         if self._description_mode == "overwrite":
@@ -724,6 +740,9 @@ class Connector:
                     candidate_id = item.get(key)
                     if candidate_id in requested_ids:
                         existing_ids.add(candidate_id)
+                for source_stix_id in item.get("x_opencti_stix_ids") or []:
+                    if source_stix_id in requested_ids:
+                        existing_ids.add(source_stix_id)
 
         return existing_ids
 
@@ -740,7 +759,7 @@ class Connector:
         sample_type = sample_object.get("type", "<unknown>")
         sample_id = sample_object.get("id", "<missing>")
         self._opencti_api.log_warning(
-            f"skip descriptions mode=create_only count={count} reason={reason} sample={sample_type}:{sample_id}"
+             f"skip descriptions mode=create_only count={count} reason={reason} sample={sample_type}:{sample_id}"
         )
 
     def _strip_descriptions(self, stix_objects: List[Dict]) -> None:
@@ -1129,7 +1148,7 @@ if __name__ == "__main__":
         opencti_client.log_info(f"Configuration: {config}")
         opencti_client.log_info(
             "Feature flags: "
-            f"connector.threat_score_from_description={config.all['connector']['threat_score_from_description']}, "
+            f"connector.threat_score_from_description={config.threat_score_from_description}, "
             f"connector.label_format={config.label_format}, "
             f"connector.description_mode={config.description_mode}, "
             f"kaspersky.expand_objects={config.expand_objects}, "
@@ -1188,5 +1207,6 @@ if __name__ == "__main__":
         dry_run=args.dry_run,
         label_format=config.label_format,
         description_mode=config.description_mode,
+        threat_score_from_description=config.threat_score_from_description,
     )
     connector.run()

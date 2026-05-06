@@ -12,15 +12,19 @@ from kaspersky.transforms.observable_transform import ObservableTransform
 
 
 class FakeBatchLookupReader:
-    def __init__(self, existing_ids=None, exception=None):
+    def __init__(self, existing_ids=None, exception=None, returned_items=None):
         self.existing_ids = set(existing_ids or [])
         self.exception = exception
+        self.returned_items = list(returned_items or [])
         self.calls = []
 
     def list(self, **kwargs):
         self.calls.append(kwargs)
         if self.exception is not None:
             raise self.exception
+
+        if self.returned_items:
+            return list(self.returned_items)
 
         requested_ids = kwargs["filters"]["filters"][0]["values"]
         result = []
@@ -105,14 +109,35 @@ class RunOnceConnector(main.Connector):
             yield batch
 
 
-def build_connector(helper, label_format=None, description_mode=None):
+class RecordingDeferredConnector(RunOnceConnector):
+    def __init__(self, *args, **kwargs):
+        self.deferred_targets = []
+        super().__init__(*args, **kwargs)
+
+    def _run_with_deferred_stop(self, target, *args, **kwargs):
+        self.deferred_targets.append(target.__name__)
+        return target(*args, **kwargs)
+
+    def _start_work(self, run_started_at, last_added):
+        del run_started_at
+        del last_added
+        return None
+
+
+def build_connector(
+    helper,
+    label_format=None,
+    description_mode=None,
+    dry_run=False,
+    threat_score_from_description=None,
+):
     connector_config = helper.config["connector"]
     return main.Connector(
         opencti_api=helper,
         stix_source=FakeSource(),
         update_interval=1,
         update_existing_data=False,
-        dry_run=False,
+        dry_run=dry_run,
         label_format=(
             connector_config["label_format"]
             if label_format is None
@@ -122,6 +147,11 @@ def build_connector(helper, label_format=None, description_mode=None):
             connector_config["description_mode"]
             if description_mode is None
             else description_mode
+        ),
+        threat_score_from_description=(
+            connector_config["threat_score_from_description"]
+            if threat_score_from_description is None
+            else threat_score_from_description
         ),
     )
 
@@ -179,6 +209,33 @@ class ConfigurationModesTest(unittest.TestCase):
                     _ = config.label_format
                 with self.assertRaises(RuntimeError):
                     _ = config.description_mode
+
+    def test_threat_score_from_description_defaults_to_false(self):
+        with mock.patch.dict(main.os.environ, {}, clear=True):
+            with mock.patch.object(main.Configuration, "_read_file_config", return_value={}):
+                config = main.Configuration()
+
+        self.assertIs(config.threat_score_from_description, False)
+
+    def test_threat_score_from_description_parses_environment_string(self):
+        for raw_value, expected in (("true", True), ("yes", True), ("false", False), ("no", False)):
+            env = {"CONNECTOR_THREAT_SCORE_FROM_DESCRIPTION": raw_value}
+            with mock.patch.dict(main.os.environ, env, clear=True):
+                with mock.patch.object(main.Configuration, "_read_file_config", return_value={}):
+                    config = main.Configuration()
+            self.assertIs(
+                config.threat_score_from_description,
+                expected,
+                msg=f"raw={raw_value!r}",
+            )
+
+    def test_threat_score_from_description_rejects_invalid_value(self):
+        env = {"CONNECTOR_THREAT_SCORE_FROM_DESCRIPTION": "maybe"}
+        with mock.patch.dict(main.os.environ, env, clear=True):
+            with mock.patch.object(main.Configuration, "_read_file_config", return_value={}):
+                config = main.Configuration()
+            with self.assertRaises(RuntimeError):
+                _ = config.threat_score_from_description
 
 
 class LabelFormatTest(unittest.TestCase):
@@ -262,6 +319,22 @@ class LabelFormatTest(unittest.TestCase):
 
 
 class ThreatScoreLabelFormatTest(unittest.TestCase):
+    def test_threat_score_from_description_sets_numeric_score_without_labels(self):
+        helper = FakeOpenCTIHelper(label_format="new")
+        connector = build_connector(helper, threat_score_from_description=True)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--score-from-description",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=74",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["x_opencti_score"], 74)
+        self.assertEqual(result["labels"], [])
+
     def test_indicator_uses_new_threat_score_label_format(self):
         helper = FakeOpenCTIHelper(label_format="new")
         connector = build_connector(helper)
@@ -427,6 +500,59 @@ class DescriptionModeBatchTest(unittest.TestCase):
         self.assertEqual(len(reader.calls), 1)
         self.assertEqual(connector._run_metrics["descriptions_stripped_total"], 1)
 
+    def test_create_only_strips_description_when_source_id_matches_x_opencti_stix_ids(self):
+        reader = FakeBatchLookupReader(
+            returned_items=[
+                {
+                    "id": "50db2d5d-c4fd-4e43-b6d4-acde11111111",
+                    "standard_id": "indicator--platform-generated",
+                    "x_opencti_stix_ids": ["indicator--source-id"],
+                }
+            ]
+        )
+        helper = FakeOpenCTIHelper(
+            description_mode="create_only",
+            api=FakeApi(batch_reader=reader),
+        )
+        connector = build_connector(helper)
+        batch = [make_described_object("indicator--source-id")]
+
+        connector._prepare_batch_for_send(batch)
+
+        self.assertNotIn("description", batch[0])
+        self.assertEqual(connector._known_existing_ids, {"indicator--source-id"})
+        self.assertEqual(connector._known_new_ids, set())
+
+    def test_create_only_matches_multiple_requested_ids_from_one_x_opencti_stix_ids_item(self):
+        reader = FakeBatchLookupReader(
+            returned_items=[
+                {
+                    "id": "f219b96f-b899-4d9c-baa8-acde22222222",
+                    "standard_id": "indicator--platform-generated",
+                    "x_opencti_stix_ids": ["indicator--source-1", "indicator--source-2"],
+                }
+            ]
+        )
+        helper = FakeOpenCTIHelper(
+            description_mode="create_only",
+            api=FakeApi(batch_reader=reader),
+        )
+        connector = build_connector(helper)
+        batch = [
+            make_described_object("indicator--source-1"),
+            make_described_object("indicator--source-2"),
+        ]
+
+        connector._prepare_batch_for_send(batch)
+
+        self.assertEqual(len(reader.calls), 1)
+        self.assertEqual(
+            connector._known_existing_ids,
+            {"indicator--source-1", "indicator--source-2"},
+        )
+        self.assertNotIn("description", batch[0])
+        self.assertNotIn("description", batch[1])
+
     def test_create_only_chunks_lookup_requests_by_200_ids(self):
         reader = FakeBatchLookupReader(existing_ids=set())
         helper = FakeOpenCTIHelper(
@@ -537,6 +663,81 @@ class DescriptionModeBatchTest(unittest.TestCase):
             helper.logged["warning"][0],
             "skip description mode=create_only type=indicator id=<missing> reason=missing-id",
         )
+
+    def test_prepare_and_print_batch_respects_skip_mode(self):
+        helper = FakeOpenCTIHelper(description_mode="skip")
+        connector = build_connector(helper, dry_run=True)
+        batch = [make_described_object("indicator--dry-run-skip")]
+
+        with mock.patch("builtins.print") as print_mock:
+            connector._prepare_and_print_batch(batch)
+
+        printed_object = json.loads(print_mock.call_args[0][0])
+        self.assertNotIn("description", printed_object)
+        self.assertNotIn("x_opencti_description", printed_object)
+
+    def test_prepare_and_print_batch_respects_create_only_mode_for_existing_objects(self):
+        reader = FakeBatchLookupReader(
+            returned_items=[
+                {
+                    "id": "7438a2ef-95f7-48e7-96fa-acde33333333",
+                    "standard_id": "indicator--platform-generated",
+                    "x_opencti_stix_ids": ["indicator--dry-run-existing"],
+                }
+            ]
+        )
+        helper = FakeOpenCTIHelper(
+            description_mode="create_only",
+            api=FakeApi(batch_reader=reader),
+        )
+        connector = build_connector(helper, dry_run=True)
+        batch = [make_described_object("indicator--dry-run-existing")]
+
+        with mock.patch("builtins.print") as print_mock:
+            connector._prepare_and_print_batch(batch)
+
+        printed_object = json.loads(print_mock.call_args[0][0])
+        self.assertNotIn("description", printed_object)
+        self.assertEqual(connector._known_existing_ids, {"indicator--dry-run-existing"})
+
+    def test_run_uses_deferred_prepare_and_print_batch_for_dry_run(self):
+        helper = FakeOpenCTIHelper(description_mode="skip")
+        helper.connect_run_and_terminate = True
+        connector = RecordingDeferredConnector(
+            opencti_api=helper,
+            stix_source=FakeSource(),
+            update_interval=1,
+            initial_history=60,
+            update_existing_data=False,
+            dry_run=True,
+            batches=[[make_described_object("indicator--dry-run-run")]],
+        )
+
+        with self.assertRaises(SystemExit):
+            with mock.patch.object(main.sys, "exit", side_effect=SystemExit(0)):
+                with mock.patch("builtins.print"):
+                    connector.run()
+
+        self.assertEqual(connector.deferred_targets, ["_prepare_and_print_batch"])
+
+    def test_run_keeps_send_path_under_deferred_prepare_and_send_batch(self):
+        helper = FakeOpenCTIHelper(description_mode="skip")
+        helper.connect_run_and_terminate = True
+        connector = RecordingDeferredConnector(
+            opencti_api=helper,
+            stix_source=FakeSource(),
+            update_interval=1,
+            initial_history=60,
+            update_existing_data=False,
+            dry_run=False,
+            batches=[[make_described_object("indicator--send-run")]],
+        )
+
+        with self.assertRaises(SystemExit):
+            with mock.patch.object(main.sys, "exit", side_effect=SystemExit(0)):
+                connector.run()
+
+        self.assertEqual(connector.deferred_targets, ["_prepare_and_send_batch"])
 
 
 class WatermarkSafetyTest(unittest.TestCase):

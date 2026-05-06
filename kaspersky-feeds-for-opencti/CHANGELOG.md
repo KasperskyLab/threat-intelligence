@@ -1,5 +1,10 @@
 # What's new in Kaspersky TI connector for OpenCTI
 
+## [1.1.2.1]
+
+### Improved runtime handling of CONNECTOR_THREAT_SCORE_FROM_DESCRIPTION
+- The flag is now resolved through a typed boolean accessor on Configuration and passed explicitly into Connector at init, replacing the previous raw string lookup via helper.config.
+
 ## [1.1.2]
 
 ### OpenCTI work tracking

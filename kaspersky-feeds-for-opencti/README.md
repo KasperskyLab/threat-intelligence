@@ -22,7 +22,11 @@ cd threat-intelligence/kaspersky-feeds-for-opencti
 
 ## Version
 
+<<<<<<< HEAD
 Current stable version: **1.1.2**
+=======
+Current stable version: **1.1.2.1**
+>>>>>>> 96d7bd8 (Kaspersky Feeds for OpenCTI - release 1.1.2.1)
 
 See [CHANGELOG.md](./CHANGELOG.md) for the list of versions and changes.
 
@@ -91,7 +95,7 @@ Optionally, many of the configuration settings can be handled solely by environm
 | `connector.threat_score_high`             | `CONNECTOR_THREAT_SCORE_HIGH`             | No        | Threshold value: objects with score greater than or equal to this value receive the label `threat_score:kaspersky:high`.<br>Default: `75`.                                                                                                                   |
 | `connector.threat_score_medium`           | `CONNECTOR_THREAT_SCORE_MEDIUM`           | No        | Threshold value: objects with score greater than or equal to this value and lower than `connector.threat_score_high` receive the label `threat_score:kaspersky:medium`. Objects below this threshold receive `threat_score:kaspersky:low`.<br>Default: `50`. |
 | `connector.label_format`                  | `CONNECTOR_LABEL_FORMAT`                  | No        | Label format for connector-authored labels on indicators and observables. Supported values: `legacy`, `new`, `both`.<br>`legacy` keeps the current labels, `new` uses `kaspersky:`-prefixed variants, and `both` emits legacy then new variants.<br>Default: `legacy`. |
-| `connector.description_mode`              | `CONNECTOR_DESCRIPTION_MODE`              | No        | Description handling policy for outgoing objects carrying `description` or `x_opencti_description`. Supported values: `overwrite`, `skip`, `create_only`.<br>`create_only` keeps descriptions only for objects that do not already exist in OpenCTI.<br>Default: `overwrite`. |
+| `connector.description_mode`              | `CONNECTOR_DESCRIPTION_MODE`              | No        | Description handling policy for outgoing objects carrying `description` or `x_opencti_description`. Supported values: `overwrite`, `skip`, `create_only`.<br>`create_only` keeps descriptions only for objects that do not already exist in OpenCTI. The same policy is applied in `dry-run`; when `dry-run + create_only` is used, the connector may query OpenCTI to determine whether an object already exists.<br>Default: `overwrite`. |
 | `kaspersky.connection_timeout`            | `KASPERSKY_CONNECTION_TIMEOUT`            | No        | HTTP timeout in seconds for all TAXII requests to the Kaspersky server. This value is used together with the connector’s automatic retry logic for polling TAXII collections.<br>Default: `60`.                                                              |
 | `connector.log_level`                     | `CONNECTOR_LOG_LEVEL`                     | No        | The log level for the connector, can be debug, info, warn or error (less verbose).<br>Default: `info`.                                                                                                                                                       |
 | `connector.update_existing_data`          | `CONNECTOR_UPDATE_EXISTING_DATA`          | No        | Whether to update data for the stix2 objects that already exist in the OpenCTI platform.<br>Default: `false`.                                                                                                                                                |
@@ -109,6 +113,8 @@ Optionally, many of the configuration settings can be handled solely by environm
 </div>
 
 **Compatibility note:** Advanced switches `connector.threat_score_from_description`, `connector.label_format`, `connector.description_mode`, `kaspersky.create_indicators` and `kaspersky.create_observables` can be omitted in your `config.yml` and compose manifests. In that case the connector keeps backward-compatible defaults (`false`, `legacy`, `overwrite`, `true`, `true` respectively).
+
+**Runtime note:** Signal-based graceful shutdown for active OpenCTI work is available only when `Connector.run()` executes in the main Python thread. If the connector is embedded into a harness and launched from a worker thread, the run continues normally but does not install OS signal handlers for graceful interruption.
 
 **Note:** It is not recommended to use too large a value for configuration parameter `kaspersky.initial_history`, because it may result in a large amount of data being received from TAXII server.
 
