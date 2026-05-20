@@ -210,7 +210,8 @@ class Configuration:
             return None
         if value not in choices:
             raise RuntimeError(
-                f"Invalid configuration: '{field_name}' contains invalid value: '{value}'. Supported values: {', '.join(choices)}"
+                f"Invalid configuration: '{field_name}' contains invalid value: "
+                f"'{value}'. Supported values: {', '.join(choices)}"
             )
         return value
 
@@ -339,8 +340,29 @@ class Connector:
     DESCRIPTION_FIELDS = ("description", "x_opencti_description")
     DESCRIPTION_LOOKUP_CHUNK_SIZE = 200
     GRACEFUL_STOP_TIMEOUT_SEC = 5
-    TERMINAL_WORK_STATUSES = {"complete", "cancelled", "canceled"}
+    STAGE_IMPORT_TIMEOUT_SEC = 1800
+    STAGE_IMPORT_INITIAL_POLL_SEC = 1
+    STAGE_IMPORT_MAX_POLL_SEC = 5
+    # If no OpenCTI internal work appears after the bounded grace window, we assume
+    # the stage was handled synchronously or produced no import work. This is a
+    # fail-open path, so the warning emitted there should be monitored in production.
+    STAGE_IMPORT_NO_WORK_GRACE_POLLS = 6
+    CONNECTOR_WORKS_QUERY_LIMIT = 500
+    TERMINAL_WORK_STATUSES = {
+        "complete",
+        "cancelled",
+        "canceled",
+        "error",
+        "failed",
+    }
     SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+    REFERENCE_FIELDS = (
+        "created_by_ref",
+        "x_opencti_created_by_ref",
+        "source_ref",
+        "target_ref",
+    )
+    LIST_REFERENCE_FIELDS = ("object_refs",)
     STIX_OBJECT_LOOKUP_ATTRIBUTES = """
         ... on StixObject {
             id
@@ -383,6 +405,8 @@ class Connector:
         self._known_new_ids: Set[str] = set()
         self._run_metrics: Dict[str, float] = {}
         self._last_run_metrics: Dict[str, float] = {}
+        self._connector_works_truncation_warned = False
+        self._connector_works_direct_query_failed = False
         self._active_work_id: Optional[str] = None
         self._active_work_finalized = False
         self._active_work_objects_count = 0
@@ -440,15 +464,16 @@ class Connector:
                         work_id = self._start_work(run_started_at_dt, last_added)
                         self._active_work_id = work_id
 
-                    for stix_batch in self._get_batches(
-                        self._stix_source.enumerate(added_after=last_added), 1000
+                    for stix_batch in self._enumerate_source_batches(
+                        added_after=last_added
                     ):
                         self._raise_if_stop_requested()
                         if work_id and not self._is_work_alive(work_id):
                             run_cancelled = True
                             self._active_work_finalized = True
                             self._opencti_api.log_info(
-                                f"OpenCTI work {work_id} is no longer active. Stopping current run."
+                                f"OpenCTI work {work_id} is no longer active. "
+                                "Stopping current run."
                             )
                             break
 
@@ -473,12 +498,14 @@ class Connector:
 
                     if self._dry_run:
                         self._opencti_api.log_info(
-                            f"Connector sent {objects_count} objects (dry run executed)"
+                            f"Connector sent {objects_count} objects "
+                            "(dry run executed)"
                         )
 
                     elif run_cancelled:
                         self._opencti_api.log_info(
-                            f"Connector run cancelled after queueing {objects_count} objects"
+                            f"Connector run cancelled after queueing "
+                            f"{objects_count} objects"
                         )
 
                     else:
@@ -503,7 +530,8 @@ class Connector:
                         in_error=True,
                     )
                     self._opencti_api.log_error(
-                       f"Error occurred during connector execution: {run_exception}"
+                        f"Error occurred during connector execution: "
+                        f"{run_exception}"
                     )
                 finally:
                     self._finalize_run_metrics(
@@ -516,7 +544,8 @@ class Connector:
                     sys.exit(0)
 
                 self._opencti_api.log_info(
-                   f"Run Complete. Sleeping until next run in {self._update_interval} seconds"
+                    f"Run Complete. Sleeping until next run in "
+                    f"{self._update_interval} seconds"
                 )
                 time.sleep(self._update_interval)
         except ConnectorStopRequested as stop_requested:
@@ -526,15 +555,50 @@ class Connector:
         finally:
             self._restore_signal_handlers(previous_handlers)
 
-    def _get_batches(self, stix_objects, size: int):
-        batch = []
-        for obj in stix_objects:
-            obj = self._processed_object(obj)
+    def _enumerate_source_clusters(self, added_after: datetime = None):
+        enumerate_clusters = getattr(self._stix_source, "enumerate_clusters", None)
+        if callable(enumerate_clusters):
+            yield from enumerate_clusters(added_after=added_after)
+            return
 
-            batch.append(obj)
-            if len(batch) == size:
+        for stix_object in self._stix_source.enumerate(added_after=added_after):
+            yield [stix_object]
+
+    def _enumerate_source_batches(self, added_after: datetime = None):
+        enumerate_batches = getattr(self._stix_source, "enumerate_batches", None)
+        if callable(enumerate_batches):
+            for stix_batch in enumerate_batches(added_after=added_after):
+                processed_batch = [
+                    self._processed_object(stix_object)
+                    for stix_object in stix_batch
+                ]
+                if processed_batch:
+                    yield processed_batch
+            return
+
+        yield from self._get_batches(
+            self._enumerate_source_clusters(added_after=added_after), 1000
+        )
+
+    def _get_batches(self, stix_clusters, size: int):
+        batch = []
+        for cluster in stix_clusters:
+            processed_cluster = [
+                self._processed_object(stix_object) for stix_object in cluster
+            ]
+            if not processed_cluster:
+                continue
+
+            cluster_size = len(processed_cluster)
+            if batch and len(batch) + cluster_size > size:
                 yield batch
                 batch = []
+
+            if cluster_size > size:
+                yield processed_cluster
+                continue
+
+            batch.extend(processed_cluster)
         if batch:
             yield batch
 
@@ -625,10 +689,10 @@ class Connector:
         for obj in stix_objects:
             print(json.dumps(obj))
 
-    def _send_objects(self, stix_objects: List, work_id: Optional[str] = None) -> None:
+    def _send_objects(self, stix_objects: List, work_id: Optional[str] = None) -> List:
         for obj in stix_objects:
             self._opencti_api.log_debug(f"Sending object: {obj}")
-        self._opencti_api.send_stix2_bundle(
+        return self._opencti_api.send_stix2_bundle(
             json.dumps(
                 {
                     "type": "bundle",
@@ -645,11 +709,109 @@ class Connector:
         self, stix_objects: List[Dict], work_id: Optional[str] = None
     ) -> None:
         self._prepare_batch_for_send(stix_objects)
-        self._send_objects(stix_objects, work_id=work_id)
+        stages = self._build_dependency_stages(stix_objects)
+        self._run_metrics["stages_total"] += len(stages)
+        for stage_index, stage_objects in enumerate(stages, start=1):
+            stage_snapshot = self._snapshot_stage_import_state(work_id)
+            sent_bundles = self._send_objects(stage_objects, work_id=work_id)
+            self._wait_for_stage_import(
+                work_id=work_id,
+                snapshot=stage_snapshot,
+                sent_bundles=sent_bundles,
+                fallback_expected_count=len(stage_objects),
+                stage_index=stage_index,
+                stages_total=len(stages),
+            )
+            if self._shutdown_signal_name is not None:
+                return
 
     def _prepare_and_print_batch(self, stix_objects: List[Dict]) -> None:
         self._prepare_batch_for_send(stix_objects)
-        self._print_object(stix_objects)
+        stages = self._build_dependency_stages(stix_objects)
+        self._run_metrics["stages_total"] += len(stages)
+        for stage_objects in stages:
+            self._print_object(stage_objects)
+
+    def _build_dependency_stages(self, stix_objects: List[Dict]) -> List[List[Dict]]:
+        object_by_id = {}
+        object_order = []
+        for stix_object in stix_objects:
+            object_id = stix_object.get("id")
+            if object_id is None:
+                raise RuntimeError("Unable to stage STIX object without id")
+            if object_id not in object_by_id:
+                object_order.append(object_id)
+            object_by_id[object_id] = stix_object
+
+        object_ids = set(object_by_id.keys())
+        dependencies_by_id = {
+            object_id: self._get_local_dependency_refs(stix_object, object_ids)
+            for object_id, stix_object in object_by_id.items()
+        }
+
+        levels = {}
+        visiting = set()
+
+        def resolve_level(object_id: str) -> int:
+            if object_id in levels:
+                return levels[object_id]
+            if object_id in visiting:
+                raise RuntimeError(f"Cyclic STIX dependency detected for {object_id}")
+
+            visiting.add(object_id)
+            dependencies = dependencies_by_id[object_id]
+            if not dependencies:
+                level = 0
+            else:
+                level = 1 + max(resolve_level(dependency) for dependency in dependencies)
+            visiting.remove(object_id)
+            levels[object_id] = level
+            return level
+
+        for object_id in object_order:
+            resolve_level(object_id)
+
+        stages_by_level = {}
+        for object_id in object_order:
+            stages_by_level.setdefault(levels[object_id], []).append(
+                object_by_id[object_id]
+            )
+
+        return [
+            stages_by_level[level]
+            for level in sorted(stages_by_level.keys())
+            if stages_by_level[level]
+        ]
+
+    def _get_local_dependency_refs(
+        self, stix_object: Dict, local_object_ids: Set[str]
+    ) -> Set[str]:
+        object_id = stix_object.get("id")
+        dependencies = set()
+
+        for field_name in Connector.REFERENCE_FIELDS:
+            dependency_id = stix_object.get(field_name)
+            if dependency_id is None or dependency_id == object_id:
+                continue
+            if dependency_id not in local_object_ids:
+                raise RuntimeError(
+                    f"Unresolved STIX reference field={field_name} "
+                    f"object={object_id} ref={dependency_id}"
+                )
+            dependencies.add(dependency_id)
+
+        for field_name in Connector.LIST_REFERENCE_FIELDS:
+            for dependency_id in stix_object.get(field_name) or []:
+                if dependency_id == object_id:
+                    continue
+                if dependency_id not in local_object_ids:
+                    raise RuntimeError(
+                        f"Unresolved STIX reference field={field_name} "
+                        f"object={object_id} ref={dependency_id}"
+                    )
+                dependencies.add(dependency_id)
+
+        return dependencies
 
     def _prepare_batch_for_send(self, stix_objects: List[Dict]) -> List[Dict]:
         if self._description_mode == "overwrite":
@@ -670,6 +832,473 @@ class Connector:
             return stix_objects
 
         return stix_objects
+
+    def _snapshot_stage_import_state(self, work_id: Optional[str]) -> Dict:
+        parent_work = self._get_work_state(work_id) if work_id is not None else None
+        parent_processed = (
+            self._get_processed_count_from_work(parent_work)
+            if parent_work is not None
+            else None
+        )
+        if parent_work is not None and parent_processed is None:
+            parent_processed = 0
+
+        return {
+            "connector_work_ids": self._snapshot_connector_work_ids(),
+            "parent_processed": parent_processed if parent_work is not None else None,
+            "parent_errors_count": self._get_errors_count_from_work(parent_work)
+            if parent_work is not None
+            else 0,
+        }
+
+    def _wait_for_stage_import(
+        self,
+        work_id: Optional[str],
+        snapshot: Dict,
+        sent_bundles: Optional[List],
+        fallback_expected_count: int,
+        stage_index: int,
+        stages_total: int,
+    ) -> None:
+        queue_protocol = getattr(self._opencti_api, "queue_protocol", None)
+        connector_work_ids = snapshot.get("connector_work_ids")
+        expected_increment = self._count_stage_expectations(
+            sent_bundles, fallback_expected_count
+        )
+        parent_processed = snapshot.get("parent_processed")
+
+        if connector_work_ids is not None:
+            self._wait_for_connector_stage_works(
+                before_work_ids=connector_work_ids,
+                parent_work_id=work_id,
+                baseline_processed=snapshot.get("parent_processed"),
+                baseline_errors_count=snapshot.get("parent_errors_count", 0),
+                expected_increment=expected_increment,
+                stage_index=stage_index,
+                stages_total=stages_total,
+            )
+            return
+
+        if work_id is not None and parent_processed is not None:
+            self._wait_for_parent_work_progress(
+                work_id=work_id,
+                baseline_processed=parent_processed,
+                baseline_errors_count=snapshot.get("parent_errors_count", 0),
+                expected_increment=expected_increment,
+                stage_index=stage_index,
+                stages_total=stages_total,
+            )
+            return
+
+        if queue_protocol == "api":
+            raise RuntimeError(
+                "Unable to wait for OpenCTI API stage import: "
+                "connector work listing is unavailable"
+            )
+
+    def _wait_for_connector_stage_works(
+        self,
+        before_work_ids: Set[str],
+        parent_work_id: Optional[str],
+        baseline_processed: Optional[int],
+        baseline_errors_count: int,
+        expected_increment: int,
+        stage_index: int,
+        stages_total: int,
+    ) -> None:
+        deadline = time.time() + Connector.STAGE_IMPORT_TIMEOUT_SEC
+        last_seen_new_work_ids = set()
+        no_work_polls = 0
+        poll_interval = Connector.STAGE_IMPORT_INITIAL_POLL_SEC
+        while time.time() < deadline:
+            self._raise_if_parent_work_cancelled_or_failed(
+                parent_work_id, stage_index, stages_total
+            )
+
+            connector_works = self._list_connector_works()
+            if connector_works is None:
+                raise RuntimeError("Unable to list OpenCTI connector works")
+
+            stage_works = [
+                work
+                for work in connector_works
+                if work.get("id") not in before_work_ids
+                and work.get("id") != parent_work_id
+            ]
+            if stage_works:
+                last_seen_new_work_ids = {work.get("id") for work in stage_works}
+                self._raise_for_stage_work_errors(stage_works, stage_index, stages_total)
+                if all(not self._is_work_alive_from_state(work) for work in stage_works):
+                    return
+                no_work_polls = 0
+            else:
+                no_work_polls += 1
+                if self._is_parent_stage_progress_complete(
+                    parent_work_id=parent_work_id,
+                    baseline_processed=baseline_processed,
+                    baseline_errors_count=baseline_errors_count,
+                    expected_increment=expected_increment,
+                    stage_index=stage_index,
+                    stages_total=stages_total,
+                ):
+                    return
+                if no_work_polls >= Connector.STAGE_IMPORT_NO_WORK_GRACE_POLLS:
+                    if parent_work_id is not None and baseline_processed is not None:
+                        # Some OpenCTI/pycti versions update only the parent work
+                        # in API mode. Absence of a visible child work is not safe
+                        # enough to advance dependency stages while the parent can
+                        # still be observed.
+                        time.sleep(poll_interval)
+                        poll_interval = min(
+                            poll_interval * 2, Connector.STAGE_IMPORT_MAX_POLL_SEC
+                        )
+                        continue
+                    if self._connector_works_truncation_warned:
+                        raise RuntimeError(
+                            f"No OpenCTI internal work detected for stage "
+                            f"{stage_index}/{stages_total}; connector work listing "
+                            f"may be truncated by pycti"
+                        )
+                    self._opencti_api.log_warning(
+                        f"No OpenCTI internal work detected for stage "
+                        f"{stage_index}/{stages_total}; continuing under "
+                        f"no-work grace after {no_work_polls} polls. Monitor "
+                        f"following works for delayed missing-reference errors."
+                    )
+                    return
+
+            time.sleep(poll_interval)
+            poll_interval = min(
+                poll_interval * 2, Connector.STAGE_IMPORT_MAX_POLL_SEC
+            )
+
+        raise TimeoutError(
+            f"Timed out waiting for OpenCTI stage {stage_index}/{stages_total} "
+            f"works={sorted(last_seen_new_work_ids)}"
+        )
+
+    def _wait_for_parent_work_progress(
+        self,
+        work_id: str,
+        baseline_processed: int,
+        baseline_errors_count: int,
+        expected_increment: int,
+        stage_index: int,
+        stages_total: int,
+    ) -> None:
+        target_processed = baseline_processed + expected_increment
+        deadline = time.time() + Connector.STAGE_IMPORT_TIMEOUT_SEC
+        poll_interval = Connector.STAGE_IMPORT_INITIAL_POLL_SEC
+        while time.time() < deadline:
+            work_state = self._get_work_state(work_id)
+            if work_state is None:
+                raise RuntimeError(f"Unable to query OpenCTI work {work_id}")
+
+            self._raise_for_stage_work_errors(
+                [work_state],
+                stage_index,
+                stages_total,
+                errors_offset=baseline_errors_count,
+            )
+            if self._is_parent_progress_complete(
+                work_state,
+                baseline_processed=baseline_processed,
+                expected_increment=expected_increment,
+            ):
+                return
+            if self._is_cancelled_or_failed_work(work_state):
+                raise RuntimeError(
+                    f"OpenCTI work {work_id} stopped before stage "
+                    f"{stage_index}/{stages_total} was processed"
+                )
+
+            time.sleep(poll_interval)
+            poll_interval = min(
+                poll_interval * 2, Connector.STAGE_IMPORT_MAX_POLL_SEC
+            )
+
+        raise TimeoutError(
+            f"Timed out waiting for OpenCTI stage {stage_index}/{stages_total} "
+            f"processed={target_processed}"
+        )
+
+    def _raise_if_parent_work_cancelled_or_failed(
+        self,
+        parent_work_id: Optional[str],
+        stage_index: int,
+        stages_total: int,
+    ) -> None:
+        if parent_work_id is None:
+            return
+
+        work_state = self._get_work_state(parent_work_id)
+        if work_state is None or not self._is_cancelled_or_failed_work(work_state):
+            return
+
+        raise RuntimeError(
+            f"OpenCTI work {parent_work_id} stopped during stage "
+            f"{stage_index}/{stages_total}"
+        )
+
+    def _raise_for_stage_work_errors(
+        self,
+        works: List[Dict],
+        stage_index: int,
+        stages_total: int,
+        errors_offset: int = 0,
+    ) -> None:
+        for work in works:
+            errors = (work.get("errors") or [])[errors_offset:]
+            status = str(work.get("status") or "").lower()
+            if not errors and status not in ("error", "failed"):
+                continue
+
+            first_error = errors[0] if errors else {"message": status}
+            raise RuntimeError(
+                f"OpenCTI stage {stage_index}/{stages_total} failed "
+                f"under strict import policy "
+                f"work={work.get('id')} error={first_error}"
+            )
+
+    def _is_parent_stage_progress_complete(
+        self,
+        parent_work_id: Optional[str],
+        baseline_processed: Optional[int],
+        baseline_errors_count: int,
+        expected_increment: int,
+        stage_index: int,
+        stages_total: int,
+    ) -> bool:
+        if parent_work_id is None or baseline_processed is None:
+            return False
+
+        work_state = self._get_work_state(parent_work_id)
+        if work_state is None:
+            return False
+
+        self._raise_for_stage_work_errors(
+            [work_state],
+            stage_index,
+            stages_total,
+            errors_offset=baseline_errors_count,
+        )
+        return self._is_parent_progress_complete(
+            work_state,
+            baseline_processed=baseline_processed,
+            expected_increment=expected_increment,
+        )
+
+    def _is_parent_progress_complete(
+        self,
+        work_state: Dict,
+        baseline_processed: int,
+        expected_increment: int,
+    ) -> bool:
+        processed = self._get_processed_count_from_work(work_state)
+        if processed is None:
+            return False
+
+        if processed >= baseline_processed + expected_increment:
+            return True
+
+        expected_total = self._get_expected_count_from_work(work_state)
+        # Some OpenCTI versions expose parent counters as stage-local totals
+        # instead of strictly cumulative values.
+        return (
+            expected_total is not None
+            and expected_total != baseline_processed
+            and expected_total >= expected_increment
+            and processed >= expected_total
+        )
+
+    def _snapshot_connector_work_ids(self) -> Optional[Set[str]]:
+        connector_works = self._list_connector_works()
+        if connector_works is None:
+            return None
+        return {work.get("id") for work in connector_works}
+
+    def _list_connector_works(self) -> Optional[List[Dict]]:
+        work_api = self._get_work_api()
+        connector_id = getattr(self._opencti_api, "connector_id", None)
+        if work_api is None or connector_id is None:
+            return None
+
+        connector_works = self._query_connector_works(connector_id)
+        if connector_works is None:
+            if not hasattr(work_api, "get_connector_works"):
+                return None
+            connector_works = list(work_api.get_connector_works(connector_id) or [])
+            self._connector_works_truncation_warned = True
+            self._opencti_api.log_warning(
+                "OpenCTI connector work listing is using pycti fallback; "
+                "results may be limited or unsorted"
+            )
+            self._opencti_api.log_debug(
+                f"Listed {len(connector_works)} OpenCTI connector works "
+                f"via pycti fallback"
+            )
+            return connector_works
+
+        self._opencti_api.log_debug(
+            f"Listed {len(connector_works)} OpenCTI connector works "
+            f"with explicit limit={Connector.CONNECTOR_WORKS_QUERY_LIMIT}"
+        )
+        if (
+            len(connector_works) >= Connector.CONNECTOR_WORKS_QUERY_LIMIT
+            and not self._connector_works_truncation_warned
+        ):
+            self._connector_works_truncation_warned = True
+            self._opencti_api.log_warning(
+                "OpenCTI connector work listing reached explicit query limit; "
+                "stage wait may need pagination/filtering if imports overlap"
+            )
+        return connector_works
+
+    def _query_connector_works(self, connector_id: str) -> Optional[List[Dict]]:
+        work_api = self._get_work_api()
+        api_client = getattr(work_api, "api", None)
+        query_method = getattr(api_client, "query", None)
+        if not callable(query_method):
+            return None
+
+        query = """
+        query ConnectorWorksQuery(
+            $count: Int
+            $orderBy: WorksOrdering
+            $orderMode: OrderingMode
+            $filters: FilterGroup
+        ) {
+            works(
+                first: $count
+                orderBy: $orderBy
+                orderMode: $orderMode
+                filters: $filters
+            ) {
+                edges {
+                    node {
+                        id
+                        name
+                        user {
+                            name
+                        }
+                        timestamp
+                        status
+                        event_source_id
+                        received_time
+                        processed_time
+                        completed_time
+                        tracking {
+                            import_expected_number
+                            import_processed_number
+                        }
+                        messages {
+                            timestamp
+                            message
+                            sequence
+                            source
+                        }
+                        errors {
+                            timestamp
+                            message
+                            sequence
+                            source
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {
+            "count": Connector.CONNECTOR_WORKS_QUERY_LIMIT,
+            "orderBy": "timestamp",
+            "orderMode": "desc",
+            "filters": {
+                "mode": "and",
+                "filters": [{"key": "connector_id", "values": [connector_id]}],
+                "filterGroups": [],
+            },
+        }
+        try:
+            try:
+                result = query_method(query, variables, True)
+            except TypeError:
+                result = query_method(query, variables)
+        except Exception as exception:
+            if not self._connector_works_direct_query_failed:
+                self._connector_works_direct_query_failed = True
+                self._opencti_api.log_warning(
+                    "Unable to list OpenCTI connector works with explicit limit; "
+                    f"falling back to pycti helper: {exception}"
+                )
+            return None
+
+        edges = result["data"]["works"]["edges"]
+        connector_works = [edge["node"] for edge in edges]
+        return sorted(connector_works, key=lambda work: work["timestamp"])
+
+    def _get_work_processed_count(self, work_id: Optional[str]) -> Optional[int]:
+        if work_id is None:
+            return None
+
+        work_state = self._get_work_state(work_id)
+        if work_state is None:
+            return None
+        return self._get_processed_count_from_work(work_state)
+
+    def _get_work_state(self, work_id: str) -> Optional[Dict]:
+        work_api = self._get_work_api()
+        if work_api is None or not hasattr(work_api, "get_work"):
+            return None
+
+        try:
+            return work_api.get_work(work_id)
+        except Exception as exception:
+            self._opencti_api.log_warning(
+                f"Unable to query OpenCTI work {work_id}: {exception}"
+            )
+            return None
+
+    @staticmethod
+    def _get_processed_count_from_work(work_state: Dict) -> Optional[int]:
+        if work_state is None:
+            return None
+        tracking = work_state.get("tracking") or {}
+        processed = tracking.get("import_processed_number")
+        if processed is None:
+            return None
+        return int(processed)
+
+    @staticmethod
+    def _get_expected_count_from_work(work_state: Dict) -> Optional[int]:
+        if work_state is None:
+            return None
+        tracking = work_state.get("tracking") or {}
+        expected = tracking.get("import_expected_number")
+        if expected is None:
+            return None
+        return int(expected)
+
+    @staticmethod
+    def _get_errors_count_from_work(work_state: Optional[Dict]) -> int:
+        if work_state is None:
+            return 0
+        return len(work_state.get("errors") or [])
+
+    @staticmethod
+    def _count_stage_expectations(
+        sent_bundles: Optional[List], fallback_expected_count: int
+    ) -> int:
+        if not sent_bundles:
+            return fallback_expected_count
+
+        expectations = 0
+        for bundle in sent_bundles:
+            try:
+                bundle_data = json.loads(bundle) if isinstance(bundle, str) else bundle
+                expectations += len(bundle_data.get("objects") or [])
+            except Exception:
+                expectations += 1
+        return expectations or fallback_expected_count
 
     def _apply_create_only_description_mode(self, stix_objects: List[Dict]) -> None:
         pending_objects: Dict[str, List[Dict]] = {}
@@ -750,7 +1379,8 @@ class Connector:
         object_type = stix_object.get("type", "<unknown>")
         object_id = stix_object.get("id", "<missing>")
         self._opencti_api.log_warning(
-            f"skip description mode=create_only type={object_type} id={object_id} reason={reason}"
+            f"skip description mode=create_only type={object_type} "
+            f"id={object_id} reason={reason}"
         )
 
     def _log_description_batch_skip(
@@ -759,7 +1389,8 @@ class Connector:
         sample_type = sample_object.get("type", "<unknown>")
         sample_id = sample_object.get("id", "<missing>")
         self._opencti_api.log_warning(
-             f"skip descriptions mode=create_only count={count} reason={reason} sample={sample_type}:{sample_id}"
+            f"skip descriptions mode=create_only count={count} "
+            f"reason={reason} sample={sample_type}:{sample_id}"
         )
 
     def _strip_descriptions(self, stix_objects: List[Dict]) -> None:
@@ -803,6 +1434,7 @@ class Connector:
         self._run_metrics = {
             "objects_total": 0,
             "batches_total": 0,
+            "stages_total": 0,
             "existence_lookup_calls": 0,
             "existence_lookup_ids_total": 0,
             "descriptions_stripped_total": 0,
@@ -1072,6 +1704,13 @@ class Connector:
         return status not in cls.TERMINAL_WORK_STATUSES
 
     @staticmethod
+    def _is_cancelled_or_failed_work(work_state: Optional[Dict]) -> bool:
+        if not work_state:
+            return False
+        status = str(work_state.get("status", "")).strip().lower()
+        return status in {"cancelled", "canceled", "error", "failed"}
+
+    @staticmethod
     def _is_missing_work_error(exception: Exception) -> bool:
         message = str(exception).strip().lower()
         return any(
@@ -1103,7 +1742,8 @@ class Connector:
             "+00:00", "Z"
         )
         return (
-            f"Kaspersky Feeds run @ {run_started_label} (added_after={last_added_label})"
+            f"Kaspersky Feeds run @ {run_started_label} "
+            f"(added_after={last_added_label})"
         )
 
     def _calc_threat_score_labels(

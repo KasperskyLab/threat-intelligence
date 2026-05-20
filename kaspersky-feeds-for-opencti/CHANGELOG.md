@@ -1,5 +1,11 @@
 # What's new in Kaspersky TI connector for OpenCTI
 
+## [1.1.3]
+
+### Cluster-aware batching
+- Bundle chunking now respects graph topology: TAXII objects are grouped into clusters so that relationships never get split from their entities/observables.
+- Shared entities are duplicated into downstream clusters that still reference them, fixing MISSING_REFERENCE_ERROR on async bundle processing.
+
 ## [1.1.2.1]
 
 ### Improved runtime handling of CONNECTOR_THREAT_SCORE_FROM_DESCRIPTION

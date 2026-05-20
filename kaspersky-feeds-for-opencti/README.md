@@ -22,7 +22,7 @@ cd threat-intelligence/kaspersky-feeds-for-opencti
 
 ## Version
 
-Current stable version: **1.1.2.1**
+Current stable version: **1.1.3**
 
 See [CHANGELOG.md](./CHANGELOG.md) for the list of versions and changes.
 

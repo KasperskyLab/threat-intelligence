@@ -17,11 +17,11 @@
 
 import re
 import json
-from typing import Dict, Generator
+from typing import Dict, Generator, List
 from datetime import datetime
 
 import stix2
-from pycti import Identity
+from pycti import Identity, Indicator
 
 from .stix_source import Stix21Source
 from .transforms import (
@@ -44,6 +44,7 @@ KASPERSKY_DESCRIPTION = (
     "password management, endpoint security, and other cybersecurity "
     "products and services"
 )
+DEFAULT_SOURCE_BATCH_SIZE = 100
 
 
 def create_author() -> Dict:
@@ -126,49 +127,103 @@ class Stix21Transformer(Stix21Source):
         super().__init__()
         self._source = source
         self._author = create_author()
-        self._enumerated_objects = set()
+        self._expand_objects = expand_objects
         self._create_indicators = create_indicators
-        if expand_objects:
-            self._transforms = [
-                ActorsTransform(author=self._author),
-                IndicatorsTransform(author=self._author, link_with_observables=create_observables and not create_indicators),
-                IndustriesTransform(author=self._author),
-                LocationsTransform(author=self._author),
-                MalwaresTransform(author=self._author),
-                ReportsTransform(author=self._author),
-            ]
-            if create_observables:
-                self._transforms.append(ObservableTransform(author=self._author))
-        else:
-            self._transforms = []
+        self._create_observables = create_observables
 
-    def enumerate(self, added_after: datetime = None) -> Generator[Dict, None, None]:
-        """
-            Enumerate available stix 2.1 objects.
-        :param added_after: datetime filter to skip old objects (optional).
-        :return: generator of the stix items.
-        """
-        yield self._author
+    def _build_transforms(self):
+        if not self._expand_objects:
+            return []
 
+        transforms = [
+            ActorsTransform(author=self._author),
+            IndicatorsTransform(
+                author=self._author,
+                link_with_observables=(
+                    self._create_observables and not self._create_indicators
+                ),
+            ),
+            IndustriesTransform(author=self._author),
+            LocationsTransform(author=self._author),
+            MalwaresTransform(author=self._author),
+            ReportsTransform(author=self._author),
+        ]
+        if self._create_observables:
+            transforms.append(ObservableTransform(author=self._author))
+        return transforms
+
+    def _source_batches(
+        self, added_after: datetime = None, size: int = DEFAULT_SOURCE_BATCH_SIZE
+    ) -> Generator[List[Dict], None, None]:
+        if size <= 0:
+            raise ValueError("source batch size must be greater than zero")
+
+        batch = []
         for stix_object in self._source.enumerate(added_after):
+            batch.append(stix_object)
+            if len(batch) >= size:
+                yield batch
+                batch = []
+
+        if batch:
+            yield batch
+
+    def _append_deduplicated(
+        self,
+        bundle_order: List[str],
+        bundle_by_id: Dict,
+        stix_object: Dict,
+    ):
+        object_id = stix_object["id"]
+        if object_id not in bundle_by_id:
+            bundle_order.append(object_id)
+        # Keep the latest representation, e.g. a finalized report with
+        # complete batch-local object_refs.
+        bundle_by_id[object_id] = processed_stix_object(stix_object)
+
+    @staticmethod
+    def _normalize_indicator_id(stix_object: Dict) -> None:
+        if stix_object.get("type") != "indicator" or "pattern" not in stix_object:
+            return
+
+        source_id = stix_object.get("id")
+        standard_id = Indicator.generate_id(stix_object["pattern"])
+        if source_id == standard_id:
+            return
+
+        source_ids = list(stix_object.get("x_opencti_stix_ids") or [])
+        if source_id and source_id not in source_ids:
+            source_ids.append(source_id)
+        stix_object["x_opencti_stix_ids"] = source_ids
+        stix_object["id"] = standard_id
+
+    def _transform_source_batch(self, source_batch: List[Dict]) -> List[Dict]:
+        transforms = self._build_transforms()
+        bundle_order = []
+        bundle_by_id = {}
+
+        self._append_deduplicated(bundle_order, bundle_by_id, dict(self._author))
+
+        for stix_object in source_batch:
             object_type = stix_object["type"]
             if object_type != "indicator":
-                yield stix_object
+                self._append_deduplicated(bundle_order, bundle_by_id, stix_object)
                 continue
 
             author_id = self._author["id"]
+            self._normalize_indicator_id(stix_object)
             stix_object["created_by_ref"] = author_id
 
             stix_objects = [stix_object]
             context = extract_context(stix_object)
-            for transform in self._transforms:
+            for transform in transforms:
                 stix_objects.extend(
                     transform.build_objects(indicator=stix_object, context=context)
                 )
 
             stix_relationships = []
             if len(stix_objects) > 1:
-                for transform in self._transforms:
+                for transform in transforms:
                     if self._create_indicators:
                         stix_relationships.extend(
                             transform.build_relationships(stix_objects)
@@ -180,26 +235,57 @@ class Stix21Transformer(Stix21Source):
                             transform.build_relationships(stix_objects[1:])
                         )
 
-            # note: the first object is original indicator and we
-            # don't want to use self._enumerated_objects filter for
-            # it, so we handle it separetly.
             if self._create_indicators:
-                yield processed_stix_object(stix_objects[0])
+                self._append_deduplicated(
+                    bundle_order, bundle_by_id, stix_objects[0]
+                )
 
-            for stix_object in stix_objects[1:]:
-                object_id = stix_object["id"]
-                if object_id in self._enumerated_objects:
-                    continue
+            for expanded_object in stix_objects[1:]:
+                self._append_deduplicated(
+                    bundle_order, bundle_by_id, expanded_object
+                )
 
-                self._enumerated_objects.add(object_id)
-                yield processed_stix_object(stix_object)
+            for relationship in stix_relationships:
+                self._append_deduplicated(bundle_order, bundle_by_id, relationship)
 
-            for stix_relationship in stix_relationships:
-                yield stix_relationship
-
-        for transform in self._transforms:
+        for transform in transforms:
             for stix_object in transform.finalize_objects():
-                yield processed_stix_object(stix_object)
+                self._append_deduplicated(bundle_order, bundle_by_id, stix_object)
 
-        # cleanup allocated resources
-        self._enumerated_objects = set()
+        return [bundle_by_id[object_id] for object_id in bundle_order]
+
+    def enumerate_batches(
+        self,
+        added_after: datetime = None,
+        size: int = DEFAULT_SOURCE_BATCH_SIZE,
+    ) -> Generator[List[Dict], None, None]:
+        """
+            Enumerate self-contained transformed STIX 2.1 bundles.
+        :param added_after: datetime filter to skip old objects (optional).
+        :param size: number of source objects to transform into one bundle.
+        :return: generator of bundle lists.
+        """
+        for source_batch in self._source_batches(added_after=added_after, size=size):
+            transformed_batch = self._transform_source_batch(source_batch)
+            if transformed_batch:
+                yield transformed_batch
+
+    def enumerate_clusters(
+        self, added_after: datetime = None
+    ) -> Generator[List[Dict], None, None]:
+        """
+            Enumerate available stix 2.1 objects grouped into atomic clusters.
+        :param added_after: datetime filter to skip old objects (optional).
+        :return: generator of cluster lists.
+        """
+        yield from self.enumerate_batches(added_after=added_after, size=1)
+
+    def enumerate(self, added_after: datetime = None) -> Generator[Dict, None, None]:
+        """
+            Enumerate available stix 2.1 objects.
+        :param added_after: datetime filter to skip old objects (optional).
+        :return: generator of the stix items.
+        """
+        for cluster in self.enumerate_clusters(added_after=added_after):
+            for stix_object in cluster:
+                yield stix_object
