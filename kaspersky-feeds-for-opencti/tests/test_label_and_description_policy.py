@@ -387,6 +387,207 @@ class ThreatScoreLabelFormatTest(unittest.TestCase):
 
         self.assertEqual(result["labels"], ["kaspersky:threat_score:high"])
 
+    def test_valid_threat_score_record_still_drives_score_labels(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--valid-score",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=90",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["x_opencti_score"], 100)
+        self.assertEqual(result["labels"], ["threat_score:kaspersky:high"])
+        self.assertEqual(helper.logged["warning"], [])
+
+    def test_malformed_threat_score_value_is_skipped_with_warning(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--malformed-score",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=abc",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["x_opencti_score"], 100)
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertIn("indicator--malformed-score", warning)
+        self.assertIn("not a valid integer", warning)
+        self.assertNotIn("threat_score=", warning)
+
+    def test_empty_threat_score_value_is_skipped_with_warning(self):
+        helper = FakeOpenCTIHelper(label_format="new")
+        helper.config["connector"]["threat_score"] = 37
+        connector = build_connector(helper, threat_score_from_description=True)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--empty-score",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=",
+                "labels": ["keep-me"],
+            }
+        )
+
+        self.assertEqual(result["x_opencti_score"], 37)
+        self.assertEqual(result["labels"], ["keep-me"])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertIn("indicator--empty-score", warning)
+        self.assertIn("missing value", warning)
+        self.assertNotIn("threat_score=", warning)
+
+    def test_incomplete_and_repeated_malformed_records_are_skipped(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--mixed-score",
+                "description": (
+                    "date_added=2026-04-21T10:00:00.000Z;"
+                    "threat_score;"
+                    "threat_score=abc;"
+                    "threat_score=10"
+                ),
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["labels"], ["threat_score:kaspersky:low"])
+        self.assertEqual(len(helper.logged["warning"]), 2)
+        warnings = helper.logged["warning"]
+        self.assertTrue(any("missing value" in message for message in warnings))
+        self.assertTrue(
+            any("not a valid integer" in message for message in warnings)
+        )
+        for message in warnings:
+            self.assertIn("indicator--mixed-score", message)
+            self.assertNotIn("threat_score=", message)
+
+    def test_malformed_record_with_newline_is_not_logged_raw(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--newline-score",
+                "description": (
+                    "date_added=2026-04-21T10:00:00.000Z;"
+                    "threat_score=1\nINJECTED-LOG-LINE"
+                ),
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["x_opencti_score"], 100)
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertIn("indicator--newline-score", warning)
+        self.assertIn("not a valid integer", warning)
+        self.assertNotIn("INJECTED-LOG-LINE", warning)
+        self.assertNotIn("\n", warning)
+
+    def test_warning_sanitizes_object_id_with_newline_and_extra_text(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator",
+                "id": "indicator--injected\nINJECTED-ID-LINE",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=abc",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertNotIn("\n", warning)
+        self.assertNotIn("\r", warning)
+        self.assertEqual(len(warning.splitlines()), 1)
+        self.assertIn("indicator--injected", warning)
+        self.assertIn("not a valid integer", warning)
+
+    def test_warning_sanitizes_object_type_control_character(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": "indicator\x07\x00",
+                "id": "indicator--control-type",
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=abc",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertNotIn("\x07", warning)
+        self.assertNotIn("\x00", warning)
+        self.assertEqual(len(warning.splitlines()), 1)
+        self.assertIn("type=indicator", warning)
+        self.assertIn("indicator--control-type", warning)
+        self.assertIn("not a valid integer", warning)
+
+    def test_warning_truncates_long_object_fields(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        long_type = "t" * 200
+        long_id = "indicator--" + "a" * 300
+        result = connector._update_score(
+            {
+                "type": long_type,
+                "id": long_id,
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=abc",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertIn(f"type={long_type[:64]}", warning)
+        self.assertIn(f"id={long_id[:128]}", warning)
+        self.assertNotIn(long_type, warning)
+        self.assertNotIn(long_id, warning)
+
+    def test_warning_uses_placeholders_for_missing_or_non_string_fields(self):
+        helper = FakeOpenCTIHelper()
+        connector = build_connector(helper)
+
+        result = connector._update_score(
+            {
+                "type": 12345,
+                "description": "date_added=2026-04-21T10:00:00.000Z;threat_score=abc",
+                "labels": [],
+            }
+        )
+
+        self.assertEqual(result["labels"], [])
+        self.assertEqual(len(helper.logged["warning"]), 1)
+        warning = helper.logged["warning"][0]
+        self.assertIn("type=<unknown>", warning)
+        self.assertIn("id=<missing>", warning)
+        self.assertIn("not a valid integer", warning)
+
 
 class DescriptionModeBatchTest(unittest.TestCase):
     def test_overwrite_preserves_description_fields_without_lookup(self):

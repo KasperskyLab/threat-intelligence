@@ -656,10 +656,13 @@ class Connector:
         if self._threat_score_from_description:
             if "threat_score=" in description:
                 for record in str(description).split(";"):
-                    parts = record.split("=")
-                    if parts[0] == "threat_score":
-                        score = int(parts[1])
-                        stix_object["x_opencti_score"] = score
+                    if not self._is_threat_score_record(record):
+                        continue
+                    score = self._parse_threat_score_record(record)
+                    if score is None:
+                        self._log_malformed_threat_score(stix_object, record)
+                        continue
+                    stix_object["x_opencti_score"] = score
             return stix_object
 
         if labels_key not in stix_object:
@@ -674,16 +677,83 @@ class Connector:
             return stix_object
 
         for record in str(description).split(";"):
-            parts = record.split("=")
-            if parts[0] == "threat_score":
-                stix_object[labels_key] = append_unique_labels(
-                    stix_object[labels_key],
-                    self._calc_threat_score_labels(
-                        int(parts[1]), threat_score_high, threat_score_medium
-                    ),
-                )
+            if not self._is_threat_score_record(record):
+                continue
+            score = self._parse_threat_score_record(record)
+            if score is None:
+                self._log_malformed_threat_score(stix_object, record)
+                continue
+            stix_object[labels_key] = append_unique_labels(
+                stix_object[labels_key],
+                self._calc_threat_score_labels(
+                    score, threat_score_high, threat_score_medium
+                ),
+            )
 
         return stix_object
+
+    @staticmethod
+    def _is_threat_score_record(record: str) -> bool:
+        """Return whether a description record is a threat score entry."""
+        return record.split("=", 1)[0] == "threat_score"
+
+    @staticmethod
+    def _parse_threat_score_record(record: str) -> Optional[int]:
+        """Parse the integer value of a threat score record.
+
+        Return None when the value is missing or is not a valid integer so that
+        malformed feed input can be skipped instead of aborting the whole run.
+        """
+        parts = record.split("=")
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _sanitize_log_field(value: object, fallback: str, max_length: int) -> str:
+        """Return a field value that is safe to embed in a single log line.
+
+        Untrusted feed fields may contain newlines, control characters or very
+        long text; those are replaced or truncated so they cannot forge extra
+        log entries. Non-string, empty or blank values fall back to a
+        placeholder.
+        """
+        if not isinstance(value, str):
+            return fallback
+
+        cleaned = "".join(
+            character if character.isprintable() else " " for character in value
+        ).strip()
+        if not cleaned:
+            return fallback
+
+        return cleaned[:max_length]
+
+    def _log_malformed_threat_score(self, stix_object: Dict, record: str) -> None:
+        """Warn about a malformed threat score record that was skipped.
+
+        The record value is intentionally not logged, and the object fields are
+        sanitized: description fragments come from external feeds and may
+        contain newlines, control characters or very long content.
+        """
+        object_type = self._sanitize_log_field(
+            stix_object.get("type"), "<unknown>", 64
+        )
+        object_id = self._sanitize_log_field(
+            stix_object.get("id"), "<missing>", 128
+        )
+        parts = record.split("=")
+        reason = (
+            "missing value"
+            if len(parts) < 2 or not parts[1].strip()
+            else "not a valid integer"
+        )
+        self._opencti_api.log_warning(
+            f"skip threat_score type={object_type} id={object_id} reason={reason}"
+        )
 
     def _print_object(self, stix_objects: List) -> None:
         for obj in stix_objects:
